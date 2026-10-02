@@ -159,7 +159,7 @@ struct OverviewView: View {
                 NSWorkspace.shared.openApplication(at: url, configuration: .init(), completionHandler: nil)
             }
             #endif
-        case "agent_gemini", "agent_antigravity":
+        case "agent_gemini", "agent_antigravity", "agent_copilot":
             #if !APPSTORE
             let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2",
                                      "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
@@ -247,8 +247,9 @@ struct ApprovalView: View {
                     PrimaryButton("Allow") {
                         HookServer.shared.sendApprovalDecision("allow")
                     }
-                    // Codex rejects updatedPermissions, so "Always" is not offered
-                    if approval?.pillId != "agent_codex" {
+                    // Neither Codex nor Copilot has an equivalent of updatedPermissions, so
+                    // offering "Always" would promise a rule nothing can persist.
+                    if approval?.pillId != "agent_codex" && approval?.pillId != "agent_copilot" {
                         SecondaryButton("Always") {
                             HookServer.shared.sendApprovalDecision("always")
                         }
@@ -1176,6 +1177,12 @@ struct IntegrationCardView: View {
             #else
             return false
             #endif
+        case "agent_copilot":
+            #if !APPSTORE
+            return HookServer.copilotHooksInstalled()
+            #else
+            return false
+            #endif
         case "agent_antigravity":
             #if !APPSTORE
             return HookServer.agyHooksInstalled()
@@ -1302,7 +1309,7 @@ struct IntegrationCardView: View {
                    : task.id == "integration_calcom"  ? appState.calcomError
                    : nil
         if let err = svcErr { return err }
-        let isHooks = task.id == "agent_gemini" || task.id == "agent_antigravity"
+        let isHooks = task.id == "agent_gemini" || task.id == "agent_antigravity" || task.id == "agent_copilot"
         let isAI    = task.id == "ai_anthropic" || task.id == "ai_google" || task.id == "ai_openai"
         if isConfigured {
             if isHooks { return "Hooks installed" }
@@ -1438,6 +1445,19 @@ struct IntegrationCardView: View {
                             .buttonStyle(.plain)
                         }
                         #endif
+                    } else if task.id == "agent_copilot" {
+                        #if !APPSTORE
+                        // The Copilot CLI is a terminal program, so this brings the
+                        // user's terminal forward rather than opening an app — the
+                        // same thing the Gemini pill does.
+                        let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2",
+                                                 "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
+                        if let hit = terminalBundleIds.compactMap({ id in
+                            NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == id }
+                        }).first {
+                            hit.activate(options: .activateIgnoringOtherApps)
+                        }
+                        #endif
                     } else if task.id == "agent_codex" {
                         #if !APPSTORE
                         if let url = NSWorkspace.shared.urlForApplication(
@@ -1516,10 +1536,13 @@ struct IntegrationCardView: View {
                             .foregroundColor(Color(hex: "#C9956A").opacity(0.85))
                             .buttonStyle(.plain)
                     }
-                    // Settings button: shown when not configured, except cursor/codex and music
+                    // Settings button: shown when not configured, except the pills whose fix is not
+                    // an API key — cursor, codex, copilot and music all have their
+                    // own installer, so a Settings link would be a dead end.
                     if !isConfigured
                        && task.id != "agent_cursor"
                        && task.id != "agent_codex"
+                       && task.id != "agent_copilot"
                        && task.id != "integration_music" {
                         Button("Settings…") {
                             NotificationCenter.default.post(name: .openFullSettings, object: nil)

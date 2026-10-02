@@ -1,9 +1,19 @@
-// Claude Code hook installation.
+// Hook installation for every agent Coucou drives.
 //
 // The rule from CLAUDE.md is strict and is followed to the letter:
-// read %USERPROFILE%\.claude\settings.json, take a dated backup, merge without
-// touching anybody else's hooks, show the diff, and write only after an explicit
-// click. Uninstall removes Coucou's entries and nothing else.
+// read the target settings file, take a dated backup, merge without touching
+// anybody else's hooks, show the diff, and write only after an explicit click.
+// Uninstall removes Coucou's entries and nothing else.
+//
+// Two harnesses, two formats:
+//
+//   Claude Code — ~/.claude/settings.json. Entries are nested groups
+//   (`{"hooks": [{"hooks": [{…}]}]}`) and the timeout key is `timeout`.
+//
+//   GitHub Copilot — ~/.copilot/hooks/coucou.json (or $COPILOT_HOME/hooks).
+//   Entries are flat, the timeout key is `timeoutSec`, and the file carries a
+//   numeric `"version": 1`. See
+//   https://docs.github.com/en/copilot/reference/hooks-reference
 //
 // The command is only the quoted exe path in forward slashes plus the event name:
 // on Windows Claude Code runs hook commands through Git Bash, and anything with
@@ -11,10 +21,31 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Manager};
 use crate::{platform, settings};
+
+/// Which harness a hook file belongs to. Serialised as the lower-case name the
+/// front end sends back, so adding a target never breaks an older settings UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HookTarget {
+    #[default]
+    Claude,
+    Copilot,
+}
+
+impl HookTarget {
+    /// The `--agent` tag the relay is invoked with, or None for Claude Code,
+    /// which is identified by having no tag at all.
+    pub fn agent_tag(self) -> Option<&'static str> {
+        match self {
+            HookTarget::Claude => None,
+            HookTarget::Copilot => Some("copilot"),
+        }
+    }
+}
 
 /// Every event the island reacts to, with the hook timeout written to settings.json.
 /// PermissionRequest waits for a human, so it gets the decision timeout + 10 s.
@@ -33,7 +64,36 @@ pub const HOOK_EVENTS: &[(&str, u64)] = &[
     ("SubagentStop", 10),
 ];
 
-/// Marker that identifies a Coucou entry inside settings.json.
+/// The same lifecycle in Copilot's own event names.
+///
+/// Deliberately narrower than HOOK_EVENTS, and the differences are not cosmetic:
+///
+///   • `agentStop` replaces `Stop`. Copilot's `Stop` alias exists only in the
+///     VS Code-compatible PascalCase form, and the `Stop` payload carries
+///     `stop_hook_active`, which we would have to reason about for no gain.
+///   • `StopFailure` has no Copilot equivalent — a failed turn surfaces through
+///     `errorOccurred` instead, which we do not need: the island already shows
+///     `PostToolUseFailure` on the tool that actually failed.
+///   • `permissionRequest` is installed deliberately. Copilot's `preToolUse` hook
+///     is fail-closed — a crash or non-zero exit *denies* the tool call even when
+///     stdout says "allow" — so it is the wrong place for a UI that may be closed,
+///     paused or crashed. `permissionRequest` is fail-open on a crash, which
+///     degrades to "Copilot asks in its own terminal", exactly as we want.
+const COPILOT_EVENTS: &[(&str, u64)] = &[
+    ("sessionStart", 10),
+    ("sessionEnd", 10),
+    ("userPromptSubmitted", 10),
+    ("preToolUse", 10),
+    ("postToolUse", 10),
+    ("postToolUseFailure", 10),
+    ("permissionRequest", 120),
+    ("agentStop", 10),
+    ("subagentStart", 10),
+    ("subagentStop", 10),
+    ("notification", 10),
+];
+
+/// Marker that identifies a Coucou entry inside a hook file.
 const MARKER: &str = "coucou-hook";
 
 #[derive(Serialize)]
@@ -56,18 +116,31 @@ pub struct HookPreview {
     pub fingerprint: String,
 }
 
-pub fn settings_path() -> PathBuf {
-    platform::home_dir().join(".claude").join("settings.json")
+/// ~/.claude/settings.json, or ~/.copilot/hooks/coucou.json.
+///
+/// Copilot's home is `$COPILOT_HOME` when set — its own docs say so, and ignoring
+/// it would install hooks where Copilot never looks.
+pub fn hook_path(target: HookTarget) -> PathBuf {
+    match target {
+        HookTarget::Claude => platform::home_dir().join(".claude").join("settings.json"),
+        HookTarget::Copilot => {
+            let home = std::env::var_os("COPILOT_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| platform::home_dir().join(".copilot"));
+            home.join("hooks").join("coucou.json")
+        }
+    }
 }
 
-/// Reads `~/.claude/settings.json`.
+/// Reads the hook file for `target`.
 ///
 /// The only error that means "start from nothing" is the file not being there.
 /// Everything else — a lock held by another process, a permission problem, JSON
 /// we cannot parse — is reported, because the alternative is treating somebody's
 /// unreadable settings as an empty object and then writing that back over them.
-fn read_settings() -> Result<Value, String> {
-    let path = settings_path();
+fn read_settings(target: HookTarget) -> Result<Value, String> {
+    let path = hook_path(target);
     match std::fs::read(&path) {
         Ok(bytes) => parse_settings(&bytes, &path.display().to_string()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
@@ -99,22 +172,35 @@ fn parse_settings(bytes: &[u8], path: &str) -> Result<Value, String> {
 /// The settings as they are, or an empty object when we cannot tell. Only for
 /// read-only paths like `status()`, which must never fail loudly; anything that
 /// writes uses `read_settings()` and surfaces the error instead.
-fn read_settings_lossy() -> Value {
-    read_settings().unwrap_or_else(|_| json!({}))
+fn read_settings_lossy(target: HookTarget) -> Value {
+    read_settings(target).unwrap_or_else(|_| json!({}))
 }
 
-#[cfg(windows)]
-fn hook_command(event: &str) -> String {
-    let exe = settings::hook_exe_path().to_string_lossy().replace('\\', "/");
-    format!("\"{exe}\" {event}")
-}
-
-/// Claude Code runs the command through `sh`, which still reads `$`, `` ` ``
-/// and `\` inside double quotes. Single quotes keep the path a path, whatever
-/// the home directory is called.
-#[cfg(unix)]
-fn hook_command(event: &str) -> String {
-    format!("{} {event}", sh_quote(&settings::hook_exe_path().to_string_lossy()))
+/// The shell command for one event, per harness.
+///
+/// Claude Code gets a bare shell string. Copilot splits the same string across
+/// `bash` and `powershell` keys and picks by OS, so both get it verbatim —
+/// GitHub's docs are explicit that the command is run through a shell there too,
+/// so the Unix quoting is correct for the `bash` value.
+fn hook_command(event: &str, target: HookTarget) -> String {
+    let exe = settings::hook_exe_path().to_string_lossy().into_owned();
+    let arg = match target.agent_tag() {
+        // The agent tag routes the event to the Copilot pill and tells the relay
+        // which answer syntax to write.
+        Some(tag) => format!("--agent {tag} {event}"),
+        None => event.to_string(),
+    };
+    #[cfg(windows)]
+    {
+        format!("\"{}\" {arg}", exe.replace('\\', "/"))
+    }
+    // Claude Code runs the command through `sh`, which still reads `$`, `` ` ``
+    // and `\` inside double quotes. Single quotes keep the path a path, whatever
+    // the home directory is called.
+    #[cfg(unix)]
+    {
+        format!("{} {arg}", sh_quote(&exe))
+    }
 }
 
 /// `s` as one single-quoted shell word: `'` becomes `'\''`, nothing else is
@@ -122,6 +208,18 @@ fn hook_command(event: &str) -> String {
 #[cfg(unix)]
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// True when a Copilot entry is one of ours. Copilot entries are flat, so this
+/// looks at `bash`/`powershell`/`command` rather than a nested `hooks` array.
+fn copilot_entry_is_ours(entry: &Value) -> bool {
+    ["bash", "powershell", "command"].iter().any(|key| {
+        entry
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(|c| c.contains(MARKER))
+            .unwrap_or(false)
+    })
 }
 
 fn entry_is_ours(entry: &Value) -> bool {
@@ -140,7 +238,14 @@ fn entry_is_ours(entry: &Value) -> bool {
 }
 
 /// Settings with Coucou's hooks added; everything else is left untouched.
-fn merged(existing: &Value) -> Value {
+fn merged(existing: &Value, target: HookTarget) -> Value {
+    match target {
+        HookTarget::Claude => merged_claude(existing),
+        HookTarget::Copilot => merged_copilot(existing),
+    }
+}
+
+fn merged_claude(existing: &Value) -> Value {
     let mut root = existing.as_object().cloned().unwrap_or_default();
     let mut hooks = root
         .get("hooks")
@@ -158,7 +263,7 @@ fn merged(existing: &Value) -> Value {
         list.push(json!({
             "hooks": [{
                 "type": "command",
-                "command": hook_command(event),
+                "command": hook_command(event, HookTarget::Claude),
                 "timeout": timeout,
             }]
         }));
@@ -169,8 +274,45 @@ fn merged(existing: &Value) -> Value {
     Value::Object(root)
 }
 
+/// Copilot's file: a numeric version, flat entries, and `timeoutSec`.
+fn merged_copilot(existing: &Value) -> Value {
+    let mut root = existing.as_object().cloned().unwrap_or_default();
+    let mut hooks = root
+        .get("hooks")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(Map::new);
+
+    for (event, timeout) in COPILOT_EVENTS {
+        let mut list = hooks
+            .get(*event)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        list.retain(|entry| !copilot_entry_is_ours(entry));
+        let command = hook_command(event, HookTarget::Copilot);
+        // Copilot picks `bash` or `powershell` by OS; both carry the same shell
+        // command, which is what its docs prescribe for a cross-platform hook.
+        list.push(json!({
+            "type": "command",
+            "bash": command,
+            "powershell": command,
+            "timeoutSec": timeout,
+        }));
+        hooks.insert((*event).to_string(), Value::Array(list));
+    }
+
+    root.insert("version".into(), json!(1));
+    root.insert("hooks".into(), Value::Object(hooks));
+    Value::Object(root)
+}
+
 /// Settings with every Coucou entry removed, and nothing else changed.
-fn without_ours(existing: &Value) -> Value {
+fn without_ours(existing: &Value, target: HookTarget) -> Value {
+    let is_ours: fn(&Value) -> bool = match target {
+        HookTarget::Claude => entry_is_ours,
+        HookTarget::Copilot => copilot_entry_is_ours,
+    };
     let mut root = existing.as_object().cloned().unwrap_or_default();
     let Some(hooks) = root.get("hooks").and_then(Value::as_object).cloned() else {
         return Value::Object(root);
@@ -179,8 +321,7 @@ fn without_ours(existing: &Value) -> Value {
     for (event, value) in hooks {
         match value.as_array() {
             Some(list) => {
-                let kept: Vec<Value> =
-                    list.iter().filter(|e| !entry_is_ours(e)).cloned().collect();
+                let kept: Vec<Value> = list.iter().filter(|e| !is_ours(e)).cloned().collect();
                 if !kept.is_empty() {
                     out.insert(event, Value::Array(kept));
                 }
@@ -195,6 +336,8 @@ fn without_ours(existing: &Value) -> Value {
     } else {
         root.insert("hooks".into(), Value::Object(out));
     }
+    // An uninstalled Copilot file keeps its version key: it is part of the file's
+    // schema, and Copilot's own docs reject a hooks file without it.
     Value::Object(root)
 }
 
@@ -212,9 +355,12 @@ fn stamp() -> String {
     )
 }
 
-fn backup_path() -> PathBuf {
-    let p = settings_path();
-    p.with_file_name(format!("settings.json.bak-{}", stamp()))
+fn backup_path(target: HookTarget) -> PathBuf {
+    let p = hook_path(target);
+    // Keeps the sibling name in the diff the user reads, so a Copilot backup
+    // cannot be mistaken for a Claude Code one.
+    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+    p.with_file_name(format!("{name}.bak-{}", stamp()))
 }
 
 /// Identifies the exact bytes a preview was computed from. FNV-1a is plenty:
@@ -228,8 +374,8 @@ fn fingerprint(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-fn current_fingerprint() -> String {
-    match std::fs::read(settings_path()) {
+fn current_fingerprint(target: HookTarget) -> String {
+    match std::fs::read(hook_path(target)) {
         Ok(bytes) => fingerprint(&bytes),
         Err(_) => fingerprint(b""),
     }
@@ -237,8 +383,12 @@ fn current_fingerprint() -> String {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-pub fn status() -> HookStatus {
-    let current = read_settings_lossy();
+pub fn status(target: HookTarget) -> HookStatus {
+    let current = read_settings_lossy(target);
+    let is_ours: fn(&Value) -> bool = match target {
+        HookTarget::Claude => entry_is_ours,
+        HookTarget::Copilot => copilot_entry_is_ours,
+    };
     let installed = current
         .get("hooks")
         .and_then(Value::as_object)
@@ -247,26 +397,26 @@ pub fn status() -> HookStatus {
                 .values()
                 .filter_map(Value::as_array)
                 .flatten()
-                .any(entry_is_ours)
+                .any(is_ours)
         })
         .unwrap_or(false);
-    let hook_path = settings::hook_exe_path();
+    let relay = settings::hook_exe_path();
     HookStatus {
         installed,
-        settings_path: settings_path().to_string_lossy().to_string(),
-        hook_ready: hook_path.exists(),
-        hook_path: hook_path.to_string_lossy().to_string(),
+        settings_path: hook_path(target).to_string_lossy().to_string(),
+        hook_ready: relay.exists(),
+        hook_path: relay.to_string_lossy().to_string(),
     }
 }
 
-pub fn preview(install: bool) -> Result<HookPreview, String> {
-    let current = read_settings()?;
-    let next = if install { merged(&current) } else { without_ours(&current) };
+pub fn preview(target: HookTarget, install: bool) -> Result<HookPreview, String> {
+    let current = read_settings(target)?;
+    let next = if install { merged(&current, target) } else { without_ours(&current, target) };
     Ok(HookPreview {
         diff: unified_diff(&pretty(&current), &pretty(&next)),
-        backup: backup_path().to_string_lossy().to_string(),
-        settings_path: settings_path().to_string_lossy().to_string(),
-        fingerprint: current_fingerprint(),
+        backup: backup_path(target).to_string_lossy().to_string(),
+        settings_path: hook_path(target).to_string_lossy().to_string(),
+        fingerprint: current_fingerprint(target),
     })
 }
 
@@ -276,27 +426,27 @@ pub fn preview(install: bool) -> Result<HookPreview, String> {
 /// in between — another tool, another window, the user's own editor — we stop
 /// and make them look at a fresh diff, because the only thing worse than not
 /// installing the hooks is silently reverting somebody else's edit.
-pub fn write(install: bool, fingerprint: &str) -> Result<String, String> {
-    let path = settings_path();
+pub fn write(target: HookTarget, install: bool, fingerprint: &str) -> Result<String, String> {
+    let path = hook_path(target);
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
 
     // Read before the backup: an unreadable file must abort before we touch
     // anything at all.
-    let current = read_settings()?;
-    if current_fingerprint() != fingerprint {
+    let current = read_settings(target)?;
+    if current_fingerprint(target) != fingerprint {
         return Err(format!(
             "{} changed since the preview. Nothing was written — review the new diff.",
             path.display()
         ));
     }
 
-    let backup = backup_path();
+    let backup = backup_path(target);
     if path.exists() {
         std::fs::copy(&path, &backup).map_err(|e| format!("backup failed: {e}"))?;
     }
 
-    let next = if install { merged(&current) } else { without_ours(&current) };
+    let next = if install { merged(&current, target) } else { without_ours(&current, target) };
     let mut text = pretty(&next);
     text.push('\n');
 
@@ -511,6 +661,23 @@ mod tests {
 
     const WHERE: &str = "settings.json";
 
+    /// These tests point HOME at a temp directory, which is a process-wide
+    /// environment variable: two of them running at once would read each other's
+    /// files and fail for reasons that have nothing to do with the code. The
+    /// lock is the fix; it is held for the whole test, never across one.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets HOME to a fresh directory and hands back the guard that keeps any
+    /// other test out until the caller is done with it.
+    fn temp_home(tag: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("coucou-hooks-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var(platform::HOME_VAR, &tmp);
+        (tmp, guard)
+    }
+
     #[test]
     fn a_utf8_bom_is_stripped_not_treated_as_corruption() {
         // PowerShell 5's `Set-Content -Encoding utf8` produces exactly this.
@@ -556,7 +723,7 @@ mod tests {
             }
         });
 
-        let after = merged(&existing);
+        let after = merged(&existing, HookTarget::Claude);
         assert_eq!(after["model"], "claude-opus-5");
         assert_eq!(after["theme"], "dark");
         assert_eq!(after["enabledPlugins"], serde_json::json!(["a", "b"]));
@@ -570,7 +737,7 @@ mod tests {
         assert!(after["hooks"]["SomeEventWeDoNotTouch"].is_array());
 
         // And removing ours puts it back exactly as it was.
-        let cleaned = without_ours(&after);
+        let cleaned = without_ours(&after, HookTarget::Claude);
         assert_eq!(cleaned, existing);
     }
 
@@ -625,12 +792,10 @@ mod tests {
     /// the home directory at a temp directory, and that is process-wide.
     #[test]
     fn writing_backs_up_preserves_and_refuses_a_changed_file() {
-        let tmp = std::env::temp_dir().join(format!("coucou-hooks-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let (tmp, _home) = temp_home("claude");
         std::fs::create_dir_all(tmp.join(".claude")).unwrap();
-        std::env::set_var(platform::HOME_VAR, &tmp);
 
-        let path = settings_path();
+        let path = hook_path(HookTarget::Claude);
         assert!(path.starts_with(&tmp), "the test must not touch the real home");
 
         // A real-shaped file, written the way PowerShell 5 would: UTF-8 with BOM.
@@ -640,9 +805,11 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         // Install.
-        let plan = preview(true).expect("a BOM must not stop the preview");
+        let plan = preview(HookTarget::Claude, true)
+            .expect("a BOM must not stop the preview");
         assert!(plan.diff.contains("coucou-hook"), "the diff must show what changes");
-        let backup = write(true, &plan.fingerprint).expect("install should succeed");
+        let backup = write(HookTarget::Claude, true, &plan.fingerprint)
+            .expect("install should succeed");
 
         // The backup holds the original bytes, BOM and all.
         assert_eq!(std::fs::read(&backup).unwrap(), bytes);
@@ -654,21 +821,156 @@ mod tests {
         assert_eq!(after["tui"]["x"], 1);
         let pre = after["hooks"]["PreToolUse"].as_array().unwrap();
         assert!(pre.iter().any(|e| serde_json::to_string(e).unwrap().contains("other-tool.exe")));
-        assert!(status().installed);
+        assert!(status(HookTarget::Claude).installed);
 
         // A file that moved since the preview is refused, and left alone.
-        let stale = preview(false).unwrap();
+        let stale = preview(HookTarget::Claude, false).unwrap();
         std::fs::write(&path, br#"{"model":"someone-else-edited-this"}"#).unwrap();
-        let err = write(false, &stale.fingerprint).unwrap_err();
+        let err = write(HookTarget::Claude, false, &stale.fingerprint).unwrap_err();
         assert!(err.contains("changed since the preview"), "got: {err}");
         let untouched: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(untouched["model"], "someone-else-edited-this");
 
         // Content we cannot parse is refused before anything is written.
         std::fs::write(&path, b"{ broken").unwrap();
-        assert!(preview(true).is_err());
-        assert!(write(true, "whatever").is_err());
+        assert!(preview(HookTarget::Claude, true).is_err());
+        assert!(write(HookTarget::Claude, true, "whatever").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{ broken");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── GitHub Copilot ──────────────────────────────────────────────────────
+    //
+    // Copilot's format is not Claude Code's with a different name: flat entries,
+    // `timeoutSec`, a numeric `version`, and a different answer syntax. These
+    // tests pin the parts that would silently break an installed hook set.
+
+    #[test]
+    fn claude_hooks_keep_their_nested_shape() {
+        let merged = merged(&json!({}), HookTarget::Claude);
+        let hooks = merged["hooks"].as_object().unwrap();
+        let entry = &hooks["PreToolUse"].as_array().unwrap()[0]["hooks"][0];
+        assert_eq!(entry["timeout"], 10);
+        assert!(entry["command"].as_str().unwrap().contains(MARKER));
+        // Claude must never be tagged: `--agent` changes the wire format, and
+        // the relay would answer with Copilot's bare object.
+        assert!(!entry["command"].as_str().unwrap().contains("--agent"));
+        assert!(merged.get("version").is_none());
+    }
+
+    #[test]
+    fn copilot_hooks_are_flat_versioned_and_tagged() {
+        let merged = merged(&json!({}), HookTarget::Copilot);
+        assert_eq!(merged["version"], 1, "Copilot rejects a file without it");
+        let hooks = merged["hooks"].as_object().unwrap();
+
+        let entry = &hooks["permissionRequest"].as_array().unwrap()[0];
+        // Flat: no nested "hooks" wrapper, and `timeoutSec` not `timeout`.
+        assert_eq!(entry["timeoutSec"], 120, "a human is answering this one");
+        assert!(entry.get("timeout").is_none());
+        assert!(entry.get("hooks").is_none());
+        assert_eq!(entry["type"], "command");
+        // Both shell keys, so the same file works on macOS and Windows.
+        assert!(entry["bash"].as_str().unwrap().contains("--agent copilot"));
+        assert_eq!(entry["bash"], entry["powershell"]);
+
+        // Every event we claim to handle must actually be written, and every
+        // command tagged — an untagged entry would route to Claude Code's pill.
+        for event in COPILOT_EVENTS {
+            let entries = hooks[event.0].as_array().unwrap();
+            assert_eq!(entries.len(), 1, "{event:?}");
+            assert!(entries[0]["bash"].as_str().unwrap().contains("--agent copilot"));
+        }
+    }
+
+    #[test]
+    fn copilot_pretooluse_never_carries_a_decision() {
+        // Copilot's command preToolUse hook is fail-closed: a crash or non-zero
+        // exit denies the tool call. Approvals therefore ride permissionRequest,
+        // which is fail-open, and preToolUse stays progress-only. If someone ever
+        // adds a decision here, a Coucou bug would break the user's editor.
+        let merged = merged(&json!({}), HookTarget::Copilot);
+        let pre = &merged["hooks"]["preToolUse"].as_array().unwrap()[0];
+        assert!(pre.get("permissionDecision").is_none());
+        assert!(pre.get("permissionDecisionReason").is_none());
+        assert!(merged["hooks"].get("permissionRequest").is_some());
+    }
+
+    #[test]
+    fn copilot_install_is_idempotent() {
+        // Reinstalling is a normal thing to do; entries must not stack up.
+        // The command embeds the relay path, which is derived from HOME, so
+        // this pins HOME too — otherwise a test that repoints it mid-run would
+        // make the two merges disagree for reasons that are not about merging.
+        let (_tmp, _home) = temp_home("copilot-idempotent");
+        let once = merged(&json!({}), HookTarget::Copilot);
+        let twice = merged(&once, HookTarget::Copilot);
+        assert_eq!(once, twice);
+        let c1 = merged(&json!({}), HookTarget::Claude);
+        assert_eq!(c1, merged(&c1, HookTarget::Claude));
+    }
+
+    #[test]
+    fn copilot_uninstall_keeps_foreign_hooks_and_the_version_key() {
+        let existing = json!({
+            "otherSetting": true,
+            "hooks": {
+                "preToolUse": [{"type": "command", "bash": "my-own-linter.sh"}],
+                "sessionStart": [{"type": "command", "bash": "someone-elses.sh"}]
+            }
+        });
+        let installed = merged(&existing, HookTarget::Copilot);
+        let removed = without_ours(&installed, HookTarget::Copilot);
+
+        assert_eq!(removed["otherSetting"], true);
+        assert_eq!(removed["hooks"]["preToolUse"][0]["bash"], "my-own-linter.sh");
+        assert_eq!(removed["hooks"]["sessionStart"][0]["bash"], "someone-elses.sh");
+        // The schema key survives an uninstall: Copilot would reject the file.
+        assert_eq!(removed["version"], 1);
+    }
+
+    #[test]
+    fn an_empty_copilot_uninstall_leaves_no_empty_object() {
+        let installed = merged(&json!({}), HookTarget::Copilot);
+        let removed = without_ours(&installed, HookTarget::Copilot);
+        assert!(removed.get("hooks").is_none(), "left an empty hooks object: {removed}");
+    }
+
+    #[test]
+    fn the_two_targets_never_read_or_write_each_others_file() {
+        let (tmp, _home) = temp_home("copilot");
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::create_dir_all(tmp.join(".copilot/hooks")).unwrap();
+
+        let claude = hook_path(HookTarget::Claude);
+        let copilot = hook_path(HookTarget::Copilot);
+        assert!(claude.starts_with(&tmp.join(".claude")));
+        assert!(copilot.starts_with(&tmp.join(".copilot")));
+
+        // A foreign hook in the Copilot file must survive a Claude Code install.
+        std::fs::write(&copilot, br#"{"version":1,"hooks":{"preToolUse":[{"type":"command","bash":"linter.sh"}]}}"#).unwrap();
+        write(HookTarget::Claude, true, &current_fingerprint(HookTarget::Claude)).unwrap();
+        let untouched: Value = serde_json::from_slice(&std::fs::read(&copilot).unwrap()).unwrap();
+        assert_eq!(untouched["hooks"]["preToolUse"][0]["bash"], "linter.sh");
+        assert!(!status(HookTarget::Copilot).installed, "Copilot must not look configured");
+
+        // And a full round trip on the Copilot side, backup included.
+        let plan = preview(HookTarget::Copilot, true).unwrap();
+        let backup = write(HookTarget::Copilot, true, &plan.fingerprint).unwrap();
+        assert!(status(HookTarget::Copilot).installed);
+        assert!(backup.contains("coucou.json.bak-"), "{backup:?}");
+
+        let after: Value = serde_json::from_slice(&std::fs::read(&copilot).unwrap()).unwrap();
+        assert_eq!(after["hooks"]["preToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(after["hooks"]["preToolUse"][0]["bash"], "linter.sh");
+
+        // Uninstalling restores the user's file byte for byte.
+        let plan = preview(HookTarget::Copilot, false).unwrap();
+        write(HookTarget::Copilot, false, &plan.fingerprint).unwrap();
+        assert!(!status(HookTarget::Copilot).installed);
+        let restored: Value = serde_json::from_slice(&std::fs::read(&copilot).unwrap()).unwrap();
+        assert_eq!(restored["hooks"]["preToolUse"][0]["bash"], "linter.sh");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

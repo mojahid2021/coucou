@@ -55,6 +55,9 @@ export const Bridge = {
   /** "Open terminal" → opens the folder in VS Code when `code` is on PATH. */
   openInVSCode: (path: string | null) => call<boolean>("open_in_vscode", { path }),
 
+  /** Opens the GitHub Copilot CLI in the session's folder. */
+  openCopilotCLI: (path: string | null) => call<boolean>("open_copilot_cli", { path }),
+
   quit: () => call<void>("quit_app"),
 
   openSettingsWindow: () => call<void>("open_settings_window"),
@@ -62,22 +65,24 @@ export const Bridge = {
   /** Writes to %LOCALAPPDATA%\Coucou\coucou.log, next to the Rust lines. */
   log: (message: string) => call<void>("log_line", { message }),
 
-  // ── Claude Code hooks ─────────────────────────────────────────────────────
-  hooksStatus: () => call<HookStatus>("hooks_status"),
+  // ── Hooks (Claude Code, GitHub Copilot) ───────────────────────────────────
+  hooksStatus: (target: HookTarget) => call<HookStatus>("hooks_status", { target }),
   /** Diff to show before anything is written. `install: false` previews removal. */
-  hooksPreview: (install: boolean) => callOrThrow<HookPreview>("hooks_preview", { install }),
+  hooksPreview: (target: HookTarget, install: boolean) =>
+    callOrThrow<HookPreview>("hooks_preview", { target, install }),
   /**
-   * Writes ~/.claude/settings.json — only ever after an explicit click, and only
+   * Writes the target's hook file — ~/.claude/settings.json or
+   * ~/.copilot/hooks/coucou.json — only ever after an explicit click, and only
    * when the file still matches the preview the user looked at.
    */
-  hooksApply: (install: boolean, fingerprint: string) =>
-    callOrThrow<string>("hooks_apply", { install, fingerprint }),
+  hooksApply: (target: HookTarget, install: boolean, fingerprint: string) =>
+    callOrThrow<string>("hooks_apply", { target, install, fingerprint }),
 
   approvalDecision: (requestId: string, decision: "allow" | "deny") =>
     call<void>("approval_decision", { requestId, decision }),
   /** "The card is up" — until this lands the relay only waits a moment. */
   approvalAck: (requestId: string) => call<void>("approval_ack", { requestId }),
-  /** "Nobody can act on this" — Claude Code asks in the terminal right away. */
+  /** "Nobody can act on this" — the agent asks in the terminal right away. */
   approvalDecline: (requestId: string) => call<void>("approval_decline", { requestId }),
 
   // ── Chat, files, secrets ──────────────────────────────────────────────────
@@ -117,6 +122,10 @@ export interface DroppedFile {
   path: string;
   size: number;
 }
+
+/** Which harness a hook file belongs to. The Rust side accepts an absent target
+ *  so an older settings window keeps working; it means Claude Code. */
+export type HookTarget = "claude" | "copilot";
 
 export interface HookStatus {
   installed: boolean;

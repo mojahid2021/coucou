@@ -12,6 +12,15 @@ import { buildPrompt } from "./chat";
 import { buildChoose, buildUpload, buildUploading } from "./upload";
 import { renderIntegrationCard, type IntegrationCardHooks } from "./integrations";
 
+/** The small grey label beside a live session's name: which agent is working. */
+function sessionSubtitle(task: AgentTask): string {
+  switch (task.id) {
+    case "integration_claude": return "Claude Code";
+    case "agent_copilot": return "Copilot";
+    default: return task.source === "n8n" ? "n8n" : "Agent";
+  }
+}
+
 export interface ViewActions {
   setView(v: IslandViewName): void;
   collapse(): void;
@@ -172,10 +181,13 @@ function buildOverview(actions: ViewActions): ViewHost {
         mode = null;
       }
 
-      // VS Code with a live Claude Code session keeps the ticker; every other
-      // pill shows its own card, exactly like IntegrationCardView.
+      // A live agent session keeps the ticker; every other pill shows its own
+      // card, exactly like IntegrationCardView. Claude Code and Copilot are both
+      // workspace agents: both stream, so both get the ticker. Hardcoding the
+      // Claude pill here left Copilot sessions rendering as an idle card.
+      const isAgentPill = task?.id === "integration_claude" || task?.id === "agent_copilot";
       const sessionActive =
-        task?.id === "integration_claude" && (task.state !== "idle" || task.steps.length > 0);
+        isAgentPill && (task.state !== "idle" || task.steps.length > 0);
 
       if (task && sessionActive) {
         if (mode !== "ticker") {
@@ -188,7 +200,7 @@ function buildOverview(actions: ViewActions): ViewHost {
         who.append(
           dot(task.color, 7),
           h("span", { class: "name", text: task.name }),
-          h("span", { class: "tool", text: task.source === "claudeCode" ? "Claude Code" : "n8n" }),
+          h("span", { class: "tool", text: sessionSubtitle(task) }),
         );
         if (task.steps.length > 1) {
           who.append(h("span", {

@@ -22,7 +22,7 @@ use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
 use claude::{Chat, ChatContext, ChatReply};
 use files::DroppedFile;
-use hooks::{HookPreview, HookStatus};
+use hooks::{HookPreview, HookStatus, HookTarget};
 use island::{PollGate, ScreenInfo};
 use pipe::Pending;
 use settings::Settings;
@@ -47,8 +47,9 @@ pub struct BootInfo {
 #[tauri::command]
 fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
     let mut settings = shared.settings.lock().unwrap().clone();
-    // The real state of ~/.claude/settings.json wins over whatever we stored.
-    settings.hooks_installed = hooks::status().installed;
+    // The real state of the hook files wins over whatever we stored.
+    settings.hooks_installed = hooks::status(HookTarget::Claude).installed;
+    settings.copilot_hooks_installed = hooks::status(HookTarget::Copilot).installed;
     let screen = island::screen_info(&app, &settings.screen);
     BootInfo {
         settings,
@@ -166,6 +167,34 @@ fn open_in_vscode(path: Option<String>) -> bool {
 }
 
 #[tauri::command]
+fn open_copilot_cli(path: Option<String>) -> bool {
+    // Same reasoning as open_in_vscode: a shell would read `&`, `^`, `%` or `$`
+    // in a folder name as syntax, so the path is passed as its own argument.
+    let path = path.filter(|p| !p.is_empty());
+    if let Some(p) = path.as_deref() {
+        let p = std::path::Path::new(p);
+        if !(p.is_absolute() && p.is_dir()) {
+            return false;
+        }
+    }
+    // The launcher is `copilot` on every platform (npm, brew, the install
+    // script, WinGet all agree on the name).
+    if let Some(exe) = platform::find_on_path("copilot") {
+        let mut cmd = Command::new(exe);
+        if let Some(p) = path.as_deref() {
+            cmd.arg(p);
+        }
+        if platform::no_console(&mut cmd).spawn().is_ok() {
+            return true;
+        }
+    }
+    if let Some(p) = path.as_deref() {
+        platform::reveal_folder(p);
+    }
+    false
+}
+
+#[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
 }
@@ -177,17 +206,23 @@ fn set_paused(paused: bool) {
     integrations::set_paused(paused);
 }
 
-// ── Claude Code hooks ─────────────────────────────────────────────────────────
+// ── Hooks (Claude Code, GitHub Copilot) ──────────────────────────────────────
+
+/// `target` is optional so an older settings window still works: without it we
+/// mean Claude Code, exactly as before.
+fn hook_target(target: Option<HookTarget>) -> HookTarget {
+    target.unwrap_or_default()
+}
 
 #[tauri::command]
-fn hooks_status() -> HookStatus {
-    hooks::status()
+fn hooks_status(target: Option<HookTarget>) -> HookStatus {
+    hooks::status(hook_target(target))
 }
 
 /// Returns the diff the user has to look at before anything is written.
 #[tauri::command]
-fn hooks_preview(install: bool) -> Result<HookPreview, String> {
-    hooks::preview(install)
+fn hooks_preview(target: Option<HookTarget>, install: bool) -> Result<HookPreview, String> {
+    hooks::preview(hook_target(target), install)
 }
 
 /// Only ever called from an explicit click in the settings window.
@@ -195,15 +230,22 @@ fn hooks_preview(install: bool) -> Result<HookPreview, String> {
 fn hooks_apply(
     app: AppHandle,
     shared: State<Shared>,
+    target: Option<HookTarget>,
     install: bool,
     fingerprint: String,
 ) -> Result<String, String> {
     // The fingerprint comes from the preview the user actually looked at, so a
-    // settings.json that changed in between is refused rather than overwritten.
-    let backup = hooks::write(install, &fingerprint)?;
+    // settings file that changed in between is refused rather than overwritten.
+    let target = hook_target(target);
+    let backup = hooks::write(target, install, &fingerprint)?;
     let updated = {
         let mut current = shared.settings.lock().unwrap();
-        current.hooks_installed = install;
+        // Each harness has its own flag: installing Copilot's hooks must not make
+        // Claude Code look configured, or the wrong pill turns green.
+        match target {
+            HookTarget::Claude => current.hooks_installed = install,
+            HookTarget::Copilot => current.copilot_hooks_installed = install,
+        }
         let _ = settings::save(&current);
         current.clone()
     };
@@ -383,6 +425,7 @@ pub fn run() {
             reposition,
             open_url,
             open_in_vscode,
+            open_copilot_cli,
             quit_app,
             hooks_status,
             hooks_preview,

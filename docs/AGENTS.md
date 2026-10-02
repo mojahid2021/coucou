@@ -73,11 +73,13 @@ Send newline-terminated JSON to the socket:
 
 ## Supported events
 
-All standard Claude Code hook events are supported, **except `PermissionRequest`**:
-approval cards are not yet implemented for third-party agents (only Claude Code gets
-one). A `PermissionRequest` from an external agent is answered immediately with no
-decision, so the relay writes nothing and the agent re-asks in its terminal.
-Approval support for other agents will be added with Codex support.
+All standard Claude Code hook events are supported. `PermissionRequest` gets an
+approval card for **declared agents** — Claude Code, Cursor, Codex and GitHub
+Copilot. For any *other* third-party agent the request is answered immediately
+with no decision, so the relay writes nothing and the agent re-asks in its
+terminal. That is deliberate: the card can only be answered by a human looking at
+the notch, and offering one for an agent Coucou knows nothing about would look
+like a Claude Code request.
 
 The pill lifecycle:
 
@@ -98,6 +100,71 @@ The pill lifecycle:
 A **declared pill** is a catalog entry (`PillCatalog.swift`) that has been enabled in **Settings → Active pills**. When a session ends for a declared pill, the pill stays visible and resets to idle instead of disappearing.
 
 A catalog pill that is not checked in Settings behaves like any other agent: it gets an automatic pill when a session starts, and that pill is removed when the session ends.
+
+### GitHub Copilot
+
+Coucou supports GitHub Copilot out of the box via **Settings → GitHub Copilot →
+Install hooks**. The installer writes one file, `~/.copilot/hooks/coucou.json`
+(or `$COPILOT_HOME/hooks/`), which covers three surfaces at once:
+
+| Surface | Why the same file works |
+|---|---|
+| Copilot CLI | `~/.copilot/hooks/*.json` is its native user-level hook directory |
+| VS Code — Local harness | Discovers `~/.copilot/hooks/*.json`; its parser accepts the Copilot format (numeric `version`, camelCase events) and maps it to the local schema |
+| VS Code — Copilot target | Runs the same Copilot SDK as the CLI |
+
+The installer is user-level only. Coucou never writes `.github/hooks/*.json`: those
+are committed to the repository and would run for every contributor, and under
+Copilot cloud agent — in a sandbox where the Coucou app does not exist.
+
+| Copilot event | Coucou event |
+|---|---|
+| `sessionStart` | `SessionStart` |
+| `userPromptSubmitted` | `UserPromptSubmit` |
+| `preToolUse` | `PreToolUse` |
+| `postToolUse` | `PostToolUse` |
+| `postToolUseFailure` | `PostToolUseFailure` |
+| `permissionRequest` | `PermissionRequest` |
+| `agentStop` | `Stop` |
+| `subagentStart` / `subagentStop` | `SubagentStart` / `SubagentStop` |
+| `sessionEnd` | `SessionEnd` |
+| `notification` | `Notification` |
+
+There is no `StopFailure` equivalent; a failed turn surfaces through
+`errorOccurred`, and the island already marks the failing tool via
+`postToolUseFailure`.
+
+The relay is invoked with `--agent copilot`, which routes events to the
+`agent_copilot` pill and switches the answer syntax (below).
+
+### ⚠ Approvals use `permissionRequest`, never `preToolUse`
+
+Copilot's `preToolUse` command hook is **fail-closed**: a crash or a non-zero exit
+*denies* the tool call, even when stdout says `permissionDecision: "allow"`. A bug
+in Coucou would therefore break the user's editor. `permissionRequest` is
+fail-open on a crash, so a Coucou that is closed, paused or slow degrades to
+"Copilot asks in its own terminal" — which is the behaviour `CLAUDE.md` requires.
+
+Coucou therefore installs `preToolUse` for progress only and never emits a
+decision from it.
+
+### The answer syntax differs per harness
+
+Both relays accept the same `--agent` tag and write whichever shape the caller
+understands:
+
+| Agent | `stdout` on a decision |
+|---|---|
+| Claude Code, Gemini, Antigravity, Codex | `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}` |
+| GitHub Copilot | `{"behavior":"allow"}` |
+
+Copilot reads `stdout` as the decision object itself, so an envelope would parse
+as a decision with no `behavior` and be ignored. Anything unrecognised prints
+nothing on both paths — silence is the safe answer, because it falls through to
+the agent's own prompt.
+
+Copilot has no equivalent of Claude Code's `updatedPermissions`, so the island
+hides **Always** for a Copilot request.
 
 The GitHub build exposes Gemini CLI (`agent_gemini`) and Antigravity (`agent_antigravity`) in Settings → Active pills. Cursor (`agent_cursor`) and Codex (`agent_codex`, GitHub build only) are there too — their pills can be declared and set as the main pill; session support is coming in a future version.
 

@@ -26,6 +26,9 @@ export interface ApprovalInfo {
   sessionId: string;
   tool: string;
   command: string;
+  /** The pill the card belongs to. Copilot has its own, so answering the card
+   *  must reset that pill and not always Claude Code's. */
+  pillId?: string;
 }
 
 export interface ChatMessage {
@@ -59,6 +62,10 @@ const task = (
 /** AgentTask.integrationAgents — same ids, names and colours as macOS. */
 export const INTEGRATION_AGENTS: AgentTask[] = [
   task("integration_claude", "VS Code", "#F5F6F8", "claudeCode"),
+  // GitHub Copilot — CLI, the VS Code extension and the Local harness. Its own
+  // pill so a Copilot session is visible next to a Claude Code one rather than
+  // hidden inside it. Colour is Copilot's own, and is unused by every other pill.
+  task("agent_copilot", "Copilot", "#8E7BEE", "agent"),
   task("integration_resend", "Resend", "#22C55E", "n8n"),
   task("integration_n8n", "n8n", "#F29B38", "n8n"),
   task("integration_vercel", "Vercel", "#7C5CFF", "n8n"),
@@ -72,6 +79,11 @@ export const TOGGLEABLE_INTEGRATION_IDS = [
   "integration_resend", "integration_n8n", "integration_vercel", "integration_github",
   "integration_notion", "integration_calcom", "integration_stripe",
 ];
+
+/** Workspace pills that are always shown and cannot be switched off: the agent
+ *  itself is either wired to Coucou (Claude Code) or is one the user installed
+ *  hooks for (Copilot). Everything else is opt-in, capped at MAX_ACTIVE. */
+export const ALWAYS_ON_PILL_IDS = ["integration_claude", "agent_copilot"];
 
 /** What an integration poller last reported. */
 export interface IntegrationInfo {
@@ -90,6 +102,8 @@ export interface Settings {
   screen: "primary" | "cursor";
   autostart: boolean;
   hooksInstalled: boolean;
+  /** Copilot CLI / VS Code hooks, written to ~/.copilot/hooks/coucou.json. */
+  copilotHooksInstalled?: boolean;
   /** Claude model used by the chat. */
   model: string;
 }
@@ -105,6 +119,7 @@ export const DEFAULT_SETTINGS: Settings = {
   screen: "primary",
   autostart: false,
   hooksInstalled: false,
+  copilotHooksInstalled: false,
   model: "claude-opus-5",
 };
 
@@ -199,11 +214,11 @@ class AppState {
     this.notify();
   }
 
-  /** loadIntegrationTasks() — VS Code always on, the rest opt-in (max 4). */
+  /** loadIntegrationTasks() — workspace pills always on, the rest opt-in (max 4). */
   loadIntegrationTasks() {
     for (const proto of INTEGRATION_AGENTS) {
       const shouldLoad =
-        proto.id === "integration_claude" || this.settings.activeIntegrations.includes(proto.id);
+        ALWAYS_ON_PILL_IDS.includes(proto.id) || this.settings.activeIntegrations.includes(proto.id);
       const idx = this.tasks.findIndex((t) => t.id === proto.id);
       if (shouldLoad && idx < 0) this.tasks.push({ ...proto, steps: [] });
       if (!shouldLoad && idx >= 0) this.tasks.splice(idx, 1);
@@ -251,7 +266,7 @@ class AppState {
   }
 
   toggleIntegration(id: string) {
-    if (id === "integration_claude") return;
+    if (ALWAYS_ON_PILL_IDS.includes(id)) return;
     const active = this.settings.activeIntegrations;
     if (active.includes(id)) {
       this.settings.activeIntegrations = active.filter((x) => x !== id);

@@ -37,6 +37,13 @@ export async function refreshConfigured() {
     data: {}, error: null, loaded: false, configured: false,
   };
   State.integrations.integration_claude = { ...claude, configured: hooks };
+  // Copilot's pill is driven by ~/.copilot/hooks/coucou.json, tracked separately
+  // from Claude Code's — installing one must not make the other look configured.
+  const copilotHooks = State.settings.copilotHooksInstalled ?? false;
+  const copilot = State.integrations.agent_copilot ?? {
+    data: {}, error: null, loaded: false, configured: false,
+  };
+  State.integrations.agent_copilot = { ...copilot, configured: copilotHooks };
   State.notify();
 }
 

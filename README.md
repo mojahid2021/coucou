@@ -32,8 +32,8 @@ Meet **Mochi**: a soft little squircle with big eyes that pops out of your notch
 
 ## Features
 
-- 🤖 **Claude Code, Cursor, Codex, Gemini CLI, Antigravity and other agents, live** — see every session in your notch: what it reads, edits and runs, step by step. Tag a hook payload with `coucou_agent` to give any agent its own pill (see [`docs/AGENTS.md`](docs/AGENTS.md)). Finished? Mochi does a happy little jump.
-- ✅ **Approve from the notch** — Claude Code and Codex permission requests show up with **Allow / Deny** (and **Always** for Claude Code), in VS Code, Cursor's terminal, or Codex. One click, back to work.
+- 🤖 **Claude Code, GitHub Copilot, Cursor, Codex, Gemini CLI, Antigravity and other agents, live** — see every session in your notch: what it reads, edits and runs, step by step. Tag a hook payload with `coucou_agent` to give any agent its own pill (see [`docs/AGENTS.md`](docs/AGENTS.md)). Finished? Mochi does a happy little jump.
+- ✅ **Approve from the notch** — Claude Code, GitHub Copilot and Codex permission requests show up with **Allow / Deny** (and **Always** for Claude Code), in VS Code, Cursor's terminal, the Copilot CLI, or Codex. One click, back to work.
 - 🧑‍💻 **Jump to the right terminal** — open the exact terminal window of a session *(macOS)*.
 - 💬 **Chat with Claude, or with Gemini and OpenAI models using your own keys** *(Gemini and OpenAI: macOS)* — click the model name above the chat box to switch provider and pick a model; the list comes from each API account.
 - 📋 **Declare the tools you use** — open Settings → Active pills and pick your main workspace tool (VS Code, Cursor, Codex or Antigravity), then toggle up to 4 more: Gemini CLI, Anthropic, Google AI, OpenAI and service integrations *(macOS)*.
@@ -132,6 +132,7 @@ Click the Coucou icon in the menu bar (macOS) or in the system tray (Windows, Li
 | What | Why | Where the key goes |
 |---|---|---|
 | **Claude Code hooks** | live sessions and approvals | **Install hooks** — Coucou backs up `~/.claude/settings.json`, merges its hooks and shows you the diff before writing anything |
+| **GitHub Copilot hooks** | live sessions and approvals in the Copilot CLI and in VS Code | Settings → GitHub Copilot — **Install hooks** backs up `~/.copilot/hooks/coucou.json`. One file covers the Copilot CLI, the VS Code extension and the editor's own agent |
 | **Gemini CLI hooks** *(macOS)* | Gemini CLI sessions in the island | **Install hooks** in Settings → Gemini CLI — backs up `~/.gemini/settings.json` |
 | **Antigravity (agy) hooks** *(macOS)* | agy sessions in the island | **Install hooks** in Settings → Antigravity — backs up `~/.gemini/config/hooks.json` |
 | **Anthropic API key** | chat and questions about files | Settings → Anthropic API · Keychain / Windows Credential Manager / Secret Service |

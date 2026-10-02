@@ -75,12 +75,28 @@ export function syncMiniBotStates(tasks: AgentTask[]) {
 export function tickMiniBots(dt: number) {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
   for (const mb of live.values()) {
+    // A canvas can lose its 2D context (GPU reset, a discarded layer), and a
+    // canvas removed from the document mid-frame throws on draw. Either one used
+    // to abort the island's whole frame loop, leaving every animation frozen
+    // until the app was relaunched — so a bad canvas is dropped, not thrown from.
+    if (!mb.canvas.isConnected) {
+      live.delete(mb.canvas);
+      continue;
+    }
     const ctx = mb.canvas.getContext("2d");
-    if (!ctx) continue;
-    mb.engine.update(dt);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, mb.cssSize, mb.cssSize);
-    mb.engine.draw(ctx, mb.cssSize, mb.cssSize);
+    if (!ctx) {
+      live.delete(mb.canvas);
+      continue;
+    }
+    try {
+      mb.engine.update(dt);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, mb.cssSize, mb.cssSize);
+      mb.engine.draw(ctx, mb.cssSize, mb.cssSize);
+    } catch {
+      // One misbehaving pill must not cost the island its animations.
+      live.delete(mb.canvas);
+    }
   }
 }
 

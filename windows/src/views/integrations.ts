@@ -53,14 +53,20 @@ const OPEN_URLS: Record<string, string> = {
   integration_calcom: "https://app.cal.com/bookings",
 };
 
+/** Pills backed by installed hooks rather than by a key. Saying "Key not
+ *  configured" about Claude Code or Copilot would be meaningless — there is no
+ *  key, and the fix is a button in Settings, not an API credential. */
+const HOOK_BACKED_PILLS = new Set(["integration_claude", "agent_copilot"]);
+
 function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   const info = State.integrations[task.id];
   const configured = info?.configured ?? false;
   const error = info?.error ?? null;
-  // The Claude Code pill is about hooks, not a key — the macOS wording would be
-  // misleading here.
-  const missing = task.id === "integration_claude" ? "Hooks not installed" : "Key not configured";
-  const label = error ?? (configured ? "Connected · loading…" : missing);
+  const isHooks = HOOK_BACKED_PILLS.has(task.id);
+  const missing = isHooks ? "Hooks not installed" : "Key not configured";
+  // A hook-backed pill is never "loading": there is nothing to poll. Once the
+  // hooks are in place the honest answer is "Hooks installed".
+  const label = error ?? (configured ? (isHooks ? "Hooks installed" : "Connected · loading…") : missing);
   const statusColor = error || !configured ? "#F4505E" : "#22C55E";
 
   const actions = h("div", { class: "int-actions" });
@@ -71,6 +77,15 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
         style: `color:${task.color}b3`,
         text: "Open Visual Studio Code",
         onclick: () => void Bridge.openInVSCode(task.sessionCwd ?? null),
+      }),
+    );
+  } else if (task.id === "agent_copilot") {
+    actions.append(
+      h("button", {
+        class: "link-btn",
+        style: `color:${task.color}b3`,
+        text: "Open GitHub Copilot CLI",
+        onclick: () => void Bridge.openCopilotCLI(task.sessionCwd ?? null),
       }),
     );
   } else if (task.id === "integration_n8n") {
@@ -92,7 +107,9 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
       }),
     );
   }
-  if (configured) {
+  // Refresh re-polls an API. A hook-backed pill has no poll, so the button would
+  // be a lie that does nothing; Settings is where its state actually lives.
+  if (configured && !isHooks) {
     actions.append(
       h("button", {
         class: "link-btn",
@@ -101,7 +118,7 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
         onclick: () => void Bridge.refreshIntegration(task.id),
       }),
     );
-  } else {
+  } else if (!configured) {
     actions.append(
       h("button", { class: "link-btn", style: "color:#8e939c", text: "Settings…", onclick: openSettings }),
     );
@@ -110,6 +127,8 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   return h(
     "div",
     { class: "int-card" },
+    // The pill's name is the project folder once a session is live, so an idle
+    // card has to fall back to the agent's own name.
     header(task.color, task.id === "integration_claude" ? "VS Code" : task.name, "Integration"),
     h("div", { class: "int-status" }, dot(statusColor, 5), h("span", { text: label })),
     actions,

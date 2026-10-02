@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- GitHub Copilot support, on macOS and on Windows/Linux. Sessions show up live on their own Copilot pill next to Claude Code, and permission requests get Allow / Deny in the notch. Install from Settings → GitHub Copilot: one hook file covers the Copilot CLI, the VS Code extension and VS Code's own agent. Approvals ride Copilot's `permissionRequest` hook rather than `preToolUse`, because Copilot treats a crashing `preToolUse` hook as a deny — a Coucou bug can never block your tool calls. In VS Code, set the Session Target to **Copilot**.
+
 ## 0.1.2 — October 2, 2026
 
 - Codex support (GitHub build): sessions show up live on the Codex pill, and permission requests get Allow and Deny in the notch. Install from Settings → Codex Hooks, then trust the hooks once with /hooks in Codex (#130) — thanks @lacatu5

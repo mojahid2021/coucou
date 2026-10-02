@@ -68,6 +68,38 @@ in time, Coucou stays quiet and Claude Code asks in the terminal as usual.
 
 It works from any terminal — Windows Terminal, PowerShell, VS Code, Git Bash.
 
+## GitHub Copilot
+
+<img src="screenshots/settings.png" width="562" alt="The settings window">
+
+**Settings… → GitHub Copilot → Install hooks…** writes a single file,
+`%USERPROFILE%\.copilot\hooks\coucou.json`, and one file covers three surfaces:
+
+| Surface | Why the same file works |
+|---|---|
+| Copilot CLI | `~/.copilot/hooks/*.json` is its native user-level hook directory |
+| VS Code — Local harness | Discovers `~/.copilot/hooks/*.json` and accepts the Copilot format |
+| VS Code — Copilot target | Runs the same Copilot SDK as the CLI |
+
+Copilot sessions get their own `agent_copilot` pill, next to Claude Code, and
+permission requests raise a normal Allow / Deny card. As with Claude Code you get
+the exact diff first, a dated backup is taken, your own Copilot hooks are never
+touched, and uninstalling removes only Coucou's entries.
+
+Copilot reads `stdout` from a permission hook as the decision itself, so the relay
+writes `{"behavior":"allow"}` for Copilot and Claude Code's `hookSpecificOutput`
+envelope for everyone else. **Always** is hidden for Copilot, which has no
+equivalent of Claude Code's `updatedPermissions`.
+
+Approvals deliberately ride Copilot's `permissionRequest` hook rather than
+`preToolUse`: Copilot treats a crashing or non-zero-exit `preToolUse` hook as a
+**deny**, so a Coucou bug would break your tool calls. `permissionRequest` is
+fail-open, which means a Coucou that is closed or slow simply leaves Copilot to
+ask in its own terminal.
+
+If `COPILOT_HOME` is set, Coucou writes to `$COPILOT_HOME/hooks/coucou.json`
+instead — that is where Copilot looks, and nowhere else.
+
 ## Chat and keys
 
 **Settings… → Claude** takes your Anthropic API key. Keys live in the **Windows

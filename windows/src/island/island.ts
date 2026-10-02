@@ -66,6 +66,19 @@ export class Island {
   private dirty = true;
   private canvasPx = 0;
 
+  /**
+   * Keep ticking until this timestamp even when nothing looks busy.
+   *
+   * A hover that opens the island can be swallowed in a single tick — the mouse
+   * crosses the 6 px wake strip and leaves again before a frame is delivered —
+   * and with nothing animating the loop would park while the island is still
+   * mid-peek. A short window after every wake-up costs a few idle frames and
+   * removes a whole class of "the animation froze" report.
+   */
+  private watchdogUntil = 0;
+  /** Counts frame failures, purely so the log cannot be flooded by a per-frame throw. */
+  private frameErrors = 0;
+
   // Rust starts the window at full size so the launch greeting has room.
   private collapsed = false;
   private collapseTimer: number | null = null;
@@ -128,6 +141,7 @@ export class Island {
           integration_calcom: "https://app.cal.com/bookings",
         };
         if (task.id === "integration_claude") void Bridge.openInVSCode(task.sessionCwd ?? null);
+        else if (task.id === "agent_copilot") void Bridge.openCopilotCLI(task.sessionCwd ?? null);
         else if (task.id === "integration_n8n") void Bridge.openN8n();
         else if (urls[task.id]) void Bridge.openUrl(urls[task.id]);
       },
@@ -143,8 +157,12 @@ export class Island {
         State.pendingApproval = null;
         State.isPinned = false;
         this.fsm.pinned = false;
-        State.updateTask("integration_claude", "working");
-        State.setPillBadge("integration_claude", null);
+        // The card can belong to any agent pill, so reset the one that asked rather
+        // than assuming Claude Code — otherwise a Copilot request leaves its own
+        // pill stuck on "approval" while an idle Claude pill flickers to "working".
+        const pillId = req.pillId ?? "integration_claude";
+        State.updateTask(pillId, "working");
+        State.setPillBadge(pillId, null);
         this.setView(State.defaultView());
       },
       toggleSound: () => {
@@ -524,12 +542,62 @@ export class Island {
 
   // ── Input ───────────────────────────────────────────────────────────────────
 
+  /**
+   * The cursor left the island: end the hover and start the collapse clock.
+   *
+   * Shared by the DOM hover listeners and the cursor poll so there is exactly one
+   * definition of "the mouse is no longer over the island". On Linux there is no
+   * global cursor (see platform::CURSOR_POLL), so the DOM listeners are the only
+   * thing that can report a leave at all.
+   *
+   * `wasInIsland` is cleared here because `onTransition` reads it: a reveal that
+   * happens while the pointer is genuinely elsewhere has to keep its own collapse
+   * timer, or it would be torn down the instant it opened.
+   */
+  private markMouseOutside() {
+    if (State.mode === "hidden") return;
+    const wasInside = this.wasInIsland;
+    this.wasInIsland = false;
+    this.fsm.mouseLeft();
+    if (wasInside && this.fsm.state === "home" && !State.isPinned) {
+      this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
+    }
+  }
+
   private wireInput() {
     // The wake strip is the only thing the OS can hit while the island is hidden.
     this.wakeStrip.addEventListener("mouseenter", () => {
       Sound.resume();
-      if (State.mode === "hidden") this.fsm.mouseEntered();
+      if (State.mode === "hidden") {
+        this.watchdogUntil = performance.now() + 600;
+        this.fsm.mouseEntered();
+      }
     });
+    this.wakeStrip.addEventListener("mouseleave", () => {
+      // Crossing the top of the screen without opening is not a hover end, and
+      // reporting one here would collapse an island the cursor never reached.
+      if (State.mode === "hidden") return;
+      this.markMouseOutside();
+    });
+
+    // Once the island is on screen it is far bigger than the 6 px strip, so it
+    // owns the hover: the cursor sits over #island, not over #wake-strip, and a
+    // strip-only listener never sees the edge being crossed. `mouseenter` and
+    // `mouseleave` do not bubble, so this is the only place that crossing is seen.
+    //
+    // On Windows the cursor poll reports the same thing a few milliseconds
+    // either side, and `mouseEntered` is idempotent per state, so the overlap is
+    // harmless — `wasInIsland` is set here to keep the poll from re-firing it.
+    this.islandEl.addEventListener("mouseenter", () => {
+      Sound.resume();
+      if (State.mode === "hidden") return;
+      if (this.fsm.state === "coucou") this.greeting.hover();
+      this.wasInIsland = true;
+      this.watchdogUntil = performance.now() + 600;
+      this.fsm.mouseEntered();
+      this.homeCollapseAt = null;
+    });
+    this.islandEl.addEventListener("mouseleave", () => this.markMouseOutside());
 
     this.islandEl.addEventListener("mousedown", (e) => {
       Sound.resume();
@@ -590,12 +658,7 @@ export class Island {
       this.fsm.mouseEntered();
       this.homeCollapseAt = null;
     }
-    if (!inIsland && this.wasInIsland) {
-      this.fsm.mouseLeft();
-      if (this.fsm.state === "home" && !State.isPinned) {
-        this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
-      }
-    }
+    if (!inIsland && this.wasInIsland) this.markMouseOutside();
     this.wasInIsland = inIsland;
 
     // Bot hover → love
@@ -675,10 +738,68 @@ export class Island {
     if (this.running) return;
     this.running = true;
     this.lastFrame = performance.now();
+    // Every wake-up gets a grace window: a hover can open and close the island
+    // inside one frame, and without this the loop can park with the peek
+    // half-finished and no outstanding animation to keep it awake.
+    this.watchdogUntil = Math.max(this.watchdogUntil, this.lastFrame + 600);
     requestAnimationFrame(this.frame);
   }
 
   private frame = (nowMs: number) => {
+    try {
+      this.stepFrame(nowMs);
+    } catch (err) {
+      // One throw used to kill every animation for the rest of the session: the
+      // frame that threw never reached its own `requestAnimationFrame`, and
+      // `running` stayed true, so `ensureRunning` refused to restart it either.
+      // Mochi simply froze until the app was relaunched.
+      this.reportFrameError(err);
+      // Ask for the next frame before anything else. A canvas whose 2D context
+      // was lost, a stale mini-bot, a view torn down mid-frame — any of these
+      // can throw once, and the island must survive it rather than die.
+      this.running = true;
+      requestAnimationFrame(this.frame);
+      return;
+    }
+
+    // A visible island must never park with work outstanding. `requestAnimationFrame`
+    // is also not guaranteed to be delivered while the window is unmapped, so the
+    // island kept a slow heartbeat alive; without it, a wake strip click that never
+    // produced a frame left the peek animation frozen half-open.
+    const settling = this.settling;
+    const busy = State.mode === "hidden"
+      ? settling
+      : settling || this.visibleBusy || this.watchdogUntil > nowMs;
+
+    if (busy) {
+      this.running = true;
+      requestAnimationFrame(this.frame);
+    } else {
+      this.running = false;
+      this.watchdogUntil = 0;
+      Sound.idle();
+    }
+  };
+
+  /** Geometry springs still moving. */
+  private get settling(): boolean {
+    return this.width.animating || this.height.animating || this.radius.animating;
+  }
+
+  /** Per-frame work while the island is on screen. */
+  private get visibleBusy(): boolean {
+    return (
+      !this.botCx.settled || !this.botCy.settled || !this.botSize.settled ||
+      (State.mode === "expanded" && State.view === "greeting") ||
+      this.engine.busy || UploadSeq.isActive
+    );
+  }
+
+  /**
+   * One frame's work. Split out of `frame` so the try/catch around it cannot
+   * accidentally swallow the re-request that keeps the loop alive.
+   */
+  private stepFrame(nowMs: number) {
     const dt = Math.min(0.05, (nowMs - this.lastFrame) / 1000);
     this.lastFrame = nowMs;
 
@@ -720,28 +841,20 @@ export class Island {
     this.views.get(State.view)?.tick?.(nowMs);
     if (UploadSeq.isActive) this.stepSequence();
     this.updateCountdown(nowMs);
+  }
 
-    // Nothing is drawn while the island is hidden, so nothing may keep the loop
-    // alive either. This used to read `... || this.engine.busy || State.mode !==
-    // "hidden"`, and engine.busy is permanently true for any state with a
-    // looping animation — breathing, ratelimit sweat, sleeping z's, the search
-    // sweep — so a hidden island went on burning frames in exactly the states it
-    // spends most of its life in. Geometry still has to finish retracting.
-    const settling =
-      this.width.animating || this.height.animating || this.radius.animating;
-    const busy = State.mode === "hidden"
-      ? settling
-      : settling ||
-        !this.botCx.settled || !this.botCy.settled || !this.botSize.settled ||
-        greetingActive || this.engine.busy || UploadSeq.isActive;
-
-    if (busy) {
-      requestAnimationFrame(this.frame);
-    } else {
-      this.running = false;
-      Sound.idle();
+  /** One line in the log, at most a few times, so a per-frame throw cannot flood it. */
+  private reportFrameError(err: unknown) {
+    const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    if (this.frameErrors++ < 5) {
+      console.error("[coucou] island frame failed", err);
+      void Bridge.log(`island frame failed — ${message}`);
     }
-  };
+    // Whatever went wrong, keep ticking for a while: if it was transient the
+    // island heals on its own, and if it was not we still stop rather than
+    // spinning at 60 Hz forever.
+    this.watchdogUntil = performance.now() + 2000;
+  }
 
   private updateBotTargets() {
     const p = botPosition(State.mode, State.view, this.height.value, State.uploadProgress);

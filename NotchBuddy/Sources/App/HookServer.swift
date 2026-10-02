@@ -233,18 +233,25 @@ final class HookServer: @unchecked Sendable {
 
         // Routing:
         // • "codex" → agent_codex (GitHub build only: workspace pill, approvals in the notch)
+        // • "copilot" → agent_copilot (GitHub build only: Copilot CLI, the VS Code
+        //   extension and the editor's own agent all send --agent copilot)
         // • other valid coucou_agent → external pill (fire-and-forget, no approval card)
         // • Cursor bundle ID → agent_cursor
         // • VS Code → integration_claude
         #if !APPSTORE
         let isCodexEvent = rawAgent == "codex"
+        let isCopilotEvent = rawAgent == "copilot"
         #else
         let isCodexEvent = false
+        let isCopilotEvent = false
         #endif
         let agentId: String
         let isExternalAgent: Bool
         if isCodexEvent {
             agentId = "agent_codex"
+            isExternalAgent = false
+        } else if isCopilotEvent {
+            agentId = "agent_copilot"
             isExternalAgent = false
         } else if let agent = validAgent {
             agentId = "agent_\(agent)"
@@ -269,6 +276,7 @@ final class HookServer: @unchecked Sendable {
             switch pending.pillId {
             case "agent_cursor": handledNote = "Handled in Cursor."
             case "agent_codex":  handledNote = "Handled in Codex."
+            case "agent_copilot": handledNote = "Handled in Copilot."
             default:             handledNote = "Handled in VS Code."
             }
             var resolved = false
@@ -472,15 +480,19 @@ final class HookServer: @unchecked Sendable {
             termProgram.lowercased().contains("vscode") ||
             bundleId.lowercased().contains("vscode"))
 
-        // Codex gets the same approval card as Claude Code / Cursor (GitHub build only).
-        // Other external agents (any other coucou_agent) answer immediately with "ask"
-        // so the agent re-asks in its own terminal — they do not get a notch card.
+        // Codex and Copilot get the same approval card as Claude Code / Cursor (GitHub
+        // build only). Other external agents (any other coucou_agent) answer
+        // immediately with "ask" so the agent re-asks in its own terminal — they
+        // do not get a notch card.
         #if !APPSTORE
         let isCodexRequest = rawAgent == "codex"
+        let isCopilotRequest = rawAgent == "copilot"
         #else
         let isCodexRequest = false
+        let isCopilotRequest = false
         #endif
-        if !isCodexRequest && Self.validateAgent(rawAgent) != nil {
+        let isDeclaredRequest = isCodexRequest || isCopilotRequest
+        if !isDeclaredRequest && Self.validateAgent(rawAgent) != nil {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -492,12 +504,14 @@ final class HookServer: @unchecked Sendable {
         let pillId: String
         if isCodexRequest {
             pillId = "agent_codex"
+        } else if isCopilotRequest {
+            pillId = "agent_copilot"
         } else if isCursorEditor {
             pillId = "agent_cursor"
         } else {
             pillId = "integration_claude"
         }
-        guard isCodexRequest || isCursorEditor || isVSCodeEditor else {
+        guard isDeclaredRequest || isCursorEditor || isVSCodeEditor else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -507,7 +521,16 @@ final class HookServer: @unchecked Sendable {
 
         let tool = payload["tool_name"] as? String ?? "Tool"
         let toolInput = payload["tool_input"] as? [String: Any] ?? [:]
-        var command = toolInput["command"] as? String ?? tool
+        // The line the card shows. `filePath` is Copilot's own spelling for
+        // `file_path`; without it a Copilot "create" approval would show only the
+        // tool name, which is exactly the detail the card exists to surface.
+        let target = toolInput["command"] as? String
+            ?? toolInput["filePath"] as? String
+            ?? toolInput["file_path"] as? String
+            ?? toolInput["path"] as? String
+            ?? toolInput["url"] as? String
+            ?? toolInput["query"] as? String
+        var command = (target.map { "\(Self.displayToolName(tool)) · \($0)" }) ?? Self.displayToolName(tool)
         let inputKey = Self.approvalInputKey(toolInput)
         nbLog("PermissionRequest \(tool) [\(pillId)]")
 
@@ -549,6 +572,7 @@ final class HookServer: @unchecked Sendable {
             switch capturedPillId {
             case "agent_cursor": note = "Handled in Cursor."
             case "agent_codex":  note = "Handled in Codex."
+            case "agent_copilot": note = "Handled in Copilot."
             default:             note = "Handled in VS Code."
             }
             self.dismissApprovalCard(note: note)
@@ -558,7 +582,8 @@ final class HookServer: @unchecked Sendable {
         approvalFDSource = source
 
         // 115s safety timeout — show a note and cancel without sending a decision.
-        // nb-hook reads EOF from the cancel handler's close and exits; Claude Code / Codex re-asks.
+        // nb-hook reads EOF from the cancel handler's close and exits; Claude Code /
+        // Codex / Copilot all re-ask in the terminal when the answer never comes.
         let captured = fd
         DispatchQueue.main.asyncAfter(deadline: .now() + 115) { [weak self] in
             guard let self, self.pendingApprovalFD == captured else { return }
@@ -566,6 +591,7 @@ final class HookServer: @unchecked Sendable {
             switch capturedPillId {
             case "agent_cursor": note = "Still waiting in Cursor."
             case "agent_codex":  note = "Still waiting in Codex."
+            case "agent_copilot": note = "Still waiting in Copilot."
             default:             note = "Still waiting in VS Code."
             }
             self.dismissApprovalCard(note: note)
@@ -680,6 +706,30 @@ final class HookServer: @unchecked Sendable {
 
     // MARK: - French step labels
 
+    /// Copilot's runtime tool names, mapped to the Claude spelling. A hook
+    /// configured with PascalCase events already gets that spelling, but a
+    /// Copilot CLI session sends the raw runtime name — without this the ticker
+    /// reads "bash · npm test" instead of "Exécute · npm test", which is the
+    /// whole point of the ticker.
+    /// https://docs.github.com/en/copilot/reference/hooks-reference
+    private static let copilotToolAliases: [String: String] = [
+        "bash": "Bash",              "powershell": "PowerShell",
+        "view": "Read",              "create": "Write",
+        "edit": "Edit",              "str_replace_editor": "Edit",
+        "apply_patch": "apply_patch", "grep": "Grep",
+        "rg": "Grep",                "glob": "Glob",
+        "web_fetch": "WebFetch",     "web_search": "WebSearch",
+        "ask_user": "Task",          "update_todo": "TodoWrite",
+        "task": "Task",
+    ]
+
+    /// The name to show for a tool, whatever dialect the agent speaks. Copilot's
+    /// runtime names resolve to the Claude spelling first, so every caller —
+    /// the ticker, the approval card, the log — shows the same thing.
+    private static func displayToolName(_ tool: String) -> String {
+        copilotToolAliases[tool] ?? tool
+    }
+
     private func frenchStep(tool: String, input: [String: Any]) -> String {
         let labels: [String: String] = [
             "Bash":        "Exécute",
@@ -700,7 +750,10 @@ final class HookServer: @unchecked Sendable {
             "update_plan": "Tâches",
             "spawn_agent": "Agent",
         ]
-        var label = labels[tool] ?? tool
+        // One indirection for every non-Claude dialect: Copilot's runtime names
+        // resolve to the Claude spelling, and Codex tools already have their own
+        // French labels, so they are looked up directly.
+        var label = labels[tool] ?? labels[Self.displayToolName(tool)] ?? tool
 
         // Codex MCP tools arrive as mcp__server__tool — show "server · tool"
         if tool.hasPrefix("mcp__") {
@@ -710,7 +763,7 @@ final class HookServer: @unchecked Sendable {
         }
 
         // Bash: infer a more precise verb from the command
-        if tool == "Bash", let cmd = input["command"] as? String {
+        if tool == "Bash" || tool == "bash", let cmd = input["command"] as? String {
             return "\(bashVerb(cmd)) · \(oneLine(cmd))"
         }
 
@@ -731,7 +784,7 @@ final class HookServer: @unchecked Sendable {
             return "\(label) · \(oneLine(cmd))"
         } else if let path = input["path"] as? String {
             return "\(label) · \(URL(fileURLWithPath: path).lastPathComponent)"
-        } else if let file = input["file_path"] as? String {
+        } else if let file = (input["file_path"] ?? input["filePath"]) as? String {
             return "\(label) · \(URL(fileURLWithPath: file).lastPathComponent)"
         } else if let query = input["query"] as? String {
             return "\(label) · \(oneLine(query))"
@@ -1393,6 +1446,161 @@ final class HookServer: @unchecked Sendable {
                                          options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
     }
 
+    // MARK: - Copilot hook installer  (#if !APPSTORE only)
+
+    /// ~/.copilot/hooks/coucou.json — or $COPILOT_HOME/hooks when that is set,
+    /// because Copilot's own docs say it looks there and nowhere else.
+    ///
+    /// One file, three surfaces: the Copilot CLI reads it natively, the VS Code
+    /// Local harness discovers `~/.copilot/hooks/*.json`, and the VS Code Copilot
+    /// target runs the same SDK as the CLI.
+    static var copilotHooksURL: URL {
+        let base = ProcessInfo.processInfo.environment["COPILOT_HOME"]
+            .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".copilot")
+        return base.appendingPathComponent("hooks/coucou.json")
+    }
+
+    /// True when the file already routes Copilot events to Coucou's nb-hook.
+    static func copilotHooksInstalled() -> Bool {
+        guard let data = try? Data(contentsOf: copilotHooksURL),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let hooks = root["hooks"] as? [String: Any] else { return false }
+        for value in hooks.values {
+            guard let entries = value as? [[String: Any]] else { continue }
+            for entry in entries {
+                // Copilot entries are flat: the command sits directly on the entry,
+                // under `bash` and `powershell` (or the shared `command` fallback).
+                for key in ["bash", "powershell", "command"] {
+                    if let cmd = entry[key] as? String,
+                       cmd.contains("nb-hook"), cmd.contains("--agent copilot") { return true }
+                }
+            }
+        }
+        return false
+    }
+
+    private var _pendingCopilotData: Data?
+    private var _pendingCopilotFingerprint: String?
+
+    func previewCopilotHooks(install: Bool) throws -> String {
+        let url = Self.copilotHooksURL
+        let exists = FileManager.default.fileExists(atPath: url.path)
+        if !install && !exists {
+            throw NSError(domain: "CoucouNoop", code: 0, userInfo: [
+                NSLocalizedDescriptionKey: "No Copilot hooks to remove."
+            ])
+        }
+        let current = exists ? try Data(contentsOf: url) : Data()
+        _pendingCopilotFingerprint = sha256Hex(current)
+        let newData = install ? try buildCopilotHooksData() : try withoutCopilotHooks()
+        _pendingCopilotData = newData
+        return String(data: newData, encoding: .utf8) ?? ""
+    }
+
+    func writeCopilotHooks() throws {
+        guard let data = _pendingCopilotData, let fp = _pendingCopilotFingerprint else { return }
+        let url = Self.copilotHooksURL
+        let current = (try? Data(contentsOf: url)) ?? Data()
+        guard sha256Hex(current) == fp else {
+            throw NSError(domain: "Coucou", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "\(url.path) changed since preview. Refresh and try again."
+            ])
+        }
+        try writeJSONFile(data, to: url, suffix: "coucou.json")
+        _pendingCopilotData = nil
+        _pendingCopilotFingerprint = nil
+    }
+
+    /// The same lifecycle as Claude Code, in Copilot's own event names.
+    ///
+    /// Two deliberate omissions. `StopFailure` has no Copilot equivalent — a failed
+    /// turn surfaces through `errorOccurred`, and the island already marks the
+    /// failing tool via `postToolUseFailure`. And `Stop` is installed as
+    /// `agentStop`: the PascalCase `Stop` alias exists but carries
+    /// `stop_hook_active`, which would mean reasoning about a continuation loop
+    /// for no gain.
+    private func buildCopilotHooksData() throws -> Data {
+        var root = try Self.strictReadJSONObject(at: Self.copilotHooksURL,
+                                                 label: "~/.copilot/hooks/coucou.json")
+        if let raw = root["hooks"], !(raw is [String: Any]) {
+            throw NSError(domain: "Coucou", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "~/.copilot/hooks/coucou.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+            ])
+        }
+        let command = "\(hookBase()) --agent copilot"
+        // permissionRequest waits for a human, so it gets the long timeout the
+        // Claude Code installer uses. Every other event is fire-and-forget.
+        let events: [(String, Int)] = [
+            ("sessionStart", 10),
+            ("userPromptSubmitted", 10),
+            ("preToolUse", 10),
+            ("postToolUse", 10),
+            ("postToolUseFailure", 10),
+            ("permissionRequest", 120),
+            ("agentStop", 10),
+            ("subagentStart", 10),
+            ("subagentStop", 10),
+            ("sessionEnd", 10),
+            ("notification", 10),
+        ]
+        var hooks = root["hooks"] as? [String: Any] ?? [:]
+        for (event, timeout) in events {
+            if let raw = hooks[event], !(raw is [[String: Any]]) {
+                throw NSError(domain: "Coucou", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "~/.copilot/hooks/coucou.json: \"hooks\"[\"\(event)\"] has an unexpected type — Coucou has not touched it."
+                ])
+            }
+            var entries = hooks[event] as? [[String: Any]] ?? []
+            entries.removeAll { copilotEntryIsOurs($0) }
+            // Flat entry, `timeoutSec` not `timeout`, and both shell keys so the
+            // same file works on macOS and Windows.
+            entries.append([
+                "type": "command",
+                "bash": command,
+                "powershell": command,
+                "timeoutSec": timeout,
+            ])
+            hooks[event] = entries
+        }
+        root["version"] = 1
+        root["hooks"] = hooks
+        return try JSONSerialization.data(withJSONObject: root,
+                                         options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+    }
+
+    private func withoutCopilotHooks() throws -> Data {
+        var root = try Self.strictReadJSONObject(at: Self.copilotHooksURL,
+                                                 label: "~/.copilot/hooks/coucou.json")
+        if let raw = root["hooks"], !(raw is [String: Any]) {
+            throw NSError(domain: "Coucou", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "~/.copilot/hooks/coucou.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+            ])
+        }
+        if var hooks = root["hooks"] as? [String: Any] {
+            for key in Array(hooks.keys) {
+                guard let entries = hooks[key] as? [[String: Any]] else { continue }
+                let kept = entries.filter { !copilotEntryIsOurs($0) }
+                if kept.isEmpty { hooks.removeValue(forKey: key) } else { hooks[key] = kept }
+            }
+            if hooks.isEmpty { root.removeValue(forKey: "hooks") } else { root["hooks"] = hooks }
+        }
+        // "version" stays: it is part of the file's schema, and Copilot rejects a
+        // hooks file without it.
+        return try JSONSerialization.data(withJSONObject: root,
+                                         options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+    }
+
+    /// A flat Copilot entry is ours when any of its command keys carries our
+    /// relay and our agent tag. Anything else belongs to the user.
+    private func copilotEntryIsOurs(_ entry: [String: Any]) -> Bool {
+        for key in ["bash", "powershell", "command"] {
+            if let cmd = entry[key] as? String,
+               cmd.contains("nb-hook"), cmd.contains("--agent copilot") { return true }
+        }
+        return false
+    }
+
     // MARK: SHA-256 fingerprint
 
     private func sha256Hex(_ data: Data) -> String {
@@ -1434,6 +1642,61 @@ private let nbHookPythonGitHub = """
 # nb-hook.py — Coucou hook relay for Claude Code and third-party agents (GitHub version)
 # Reads JSON from stdin, forwards to Coucou via Unix socket, translates response.
 import sys, json, os, socket
+
+def decision_output(decision, agent, payload):
+    # The object each harness expects on stdout, or None to stay silent.
+    #
+    # Claude Code — and Gemini, Antigravity and Codex, which copy its envelope —
+    # wants hookSpecificOutput. GitHub Copilot wants the bare object: its
+    # permissionRequest reads stdout as the decision itself, so an envelope here
+    # would parse as a decision with no "behavior" and silently fall through to
+    # Copilot's own prompt.
+    # https://docs.github.com/en/copilot/reference/hooks-reference
+    if agent == 'copilot':
+        if decision in ('allow', 'always'):
+            return {'behavior': 'allow'}
+        if decision == 'deny':
+            return {'behavior': 'deny', 'message': 'Denied from Coucou'}
+        return None
+
+    if decision == 'allow':
+        answer = {'behavior': 'allow'}
+    elif decision == 'always' and agent != 'codex':
+        # Let Claude Code persist the rule via updatedPermissions
+        answer = {'behavior': 'allow', 'updatedPermissions': payload.get('permission_suggestions', [])}
+    elif decision == 'always':
+        # Codex rejects updatedPermissions — answer a plain allow instead
+        answer = {'behavior': 'allow'}
+    elif decision == 'deny':
+        answer = {'behavior': 'deny', 'message': 'Denied from Coucou'}
+    else:
+        # 'ask' or anything unknown: no output, and the agent re-asks itself.
+        return None
+    return {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': answer}}
+
+def normalize_copilot_event(name):
+    # Copilot's own camelCase event names, translated to the canonical spellings
+    # the app switches on. permissionRequest is the one that matters most: left
+    # as it is, it matches no arm in processEvent / processPermissionRequest, so
+    # no card is ever shown and the relay waits out its whole budget for an
+    # answer that cannot come.
+    # https://docs.github.com/en/copilot/reference/hooks-reference
+    mapping = {
+        'permissionRequest': 'PermissionRequest',
+        'agentStop': 'Stop',
+        'sessionStart': 'SessionStart',
+        'sessionEnd': 'SessionEnd',
+        'userPromptSubmitted': 'UserPromptSubmit',
+        'preToolUse': 'PreToolUse',
+        'postToolUse': 'PostToolUse',
+        'postToolUseFailure': 'PostToolUseFailure',
+        'subagentStart': 'SubagentStart',
+        'subagentStop': 'SubagentStop',
+        'notification': 'Notification',
+        'errorOccurred': 'StopFailure',
+        'preCompact': 'PreCompact',
+    }
+    return mapping.get(name, name)
 
 def normalize_event(name):
     mapping = {
@@ -1511,12 +1774,25 @@ def main():
         else:
             payload['cwd'] = os.getcwd()
 
-    # Normalize event name and tool fields (Gemini CLI / Antigravity → canonical names)
+    # Normalize event name and tool fields (Gemini CLI / Antigravity → canonical
+    # names; Copilot's camelCase names → the same canonical set)
     try:
         raw_event = payload.get('hook_event_name', '') or arg_event
         if raw_event:
+            if agent == 'copilot':
+                raw_event = normalize_copilot_event(raw_event)
             payload['hook_event_name'] = normalize_event(raw_event)
         normalize_tool_fields(payload)
+        # Copilot's native payload is camelCase (toolName, toolArgs, sessionId)
+        # while the app reads Claude Code's snake_case. Copilot only emits the
+        # snake_case form in its VS Code-compatible PascalCase mode, so without
+        # this a CLI session shows a bare "Tool" in the ticker and an approval
+        # card with no command on it. Never overwrites a value already present.
+        if agent == 'copilot':
+            for to, frm in (('tool_name', 'toolName'), ('tool_input', 'toolArgs'),
+                             ('session_id', 'sessionId')):
+                if to not in payload and frm in payload:
+                    payload[to] = payload.pop(frm)
     except Exception:
         pass
 
@@ -1548,34 +1824,16 @@ def main():
                     decision = resp_obj.get('permissionDecision', '')
                 except Exception:
                     decision = ''
-                if decision == 'allow':
-                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
+                out = decision_output(decision, agent, payload)
+                if out is not None:
                     sys.stdout.write(json.dumps(out) + '\\n')
                     sys.stdout.flush()
-                    sys.exit(0)
-                elif decision == 'always' and agent != 'codex':
-                    # Let Claude Code persist the rule via updatedPermissions
-                    suggestions = payload.get('permission_suggestions', [])
-                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
-                    sys.stdout.write(json.dumps(out) + '\\n')
-                    sys.stdout.flush()
-                    sys.exit(0)
-                elif decision == 'always':
-                    # Codex rejects updatedPermissions — answer a plain allow instead
-                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
-                    sys.stdout.write(json.dumps(out) + '\\n')
-                    sys.stdout.flush()
-                    sys.exit(0)
-                elif decision == 'deny':
-                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
-                    sys.stdout.write(json.dumps(out) + '\\n')
-                    sys.stdout.flush()
-                    sys.exit(0)
-                # 'ask' or unknown: fall through → no output → agent re-asks
+                # None: 'ask' or unknown → no output → agent re-asks itself
         except Exception:
             pass
-        # App unreachable, timed out, or no explicit decision — print nothing
-        # Claude Code / Codex will handle the absence of output (re-ask or default behaviour)
+        # App unreachable, timed out, or no explicit decision — print nothing.
+        # Claude Code / Codex / Copilot all treat the absence of output as "ask me
+        # in the terminal", which is exactly what we want when we cannot answer.
         sys.exit(0)
 
     # All other events: fire-and-forget (0.3s timeout, never blocks)
