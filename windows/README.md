@@ -247,6 +247,15 @@ What changes on Linux:
   shape, so the compositor sends every other click to what is underneath.
 - **Mochi's eyes** follow the pointer only while it is over the island: Wayland
   gives no app the cursor position anywhere else.
+- **The island animates continuously while it is on screen**, exactly as on the
+  Mac — it does not idle just because nothing is moving. Mochi's blinks, the
+  status dots, the pill grid and the step ticker are all driven by wall-clock
+  time rather than by a transition, so a loop that parked itself when it
+  decided "nothing is animating" froze them all. Because Linux has no global
+  cursor either, nothing would wake that loop again once the pointer left the
+  island: on Windows the 60 Hz cursor poll kept re-arming it and hid the flaw.
+  The loop now parks only once the island is hidden, which is what keeps it off
+  the CPU when it is not on screen.
 - **Claude Code hooks** go through `~/.local/share/coucou/bin/coucou-hook` and a
   Unix socket at `$XDG_RUNTIME_DIR/coucou.sock`. Both ends check that the other
   runs as the same user.

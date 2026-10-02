@@ -65,8 +65,15 @@ export class IslandStateMachine {
     }
   }
 
+  /**
+   * Compact island clicked.
+   *
+   * Also accepts `hidden`: after an alert the island can be on screen while the
+   * FSM never saw the mouse enter, and the click must still open it. Matches
+   * `IslandStateMachine.click()`.
+   */
   click() {
-    if (this.state !== "petit") return;
+    if (this.state !== "petit" && this.state !== "hidden") return;
     this.cancelTimers();
     this.transition("home");
   }

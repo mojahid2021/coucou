@@ -8,6 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "icons": "node scripts/gen-icons.mjs",
+    "test": "node test/run.mjs",
     "tauri": "tauri",
     "predev": "cargo build --release -p coucou-hook",
     "prebuild": "cargo build --release -p coucou-hook",

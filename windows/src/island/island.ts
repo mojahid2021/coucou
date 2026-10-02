@@ -69,11 +69,10 @@ export class Island {
   /**
    * Keep ticking until this timestamp even when nothing looks busy.
    *
-   * A hover that opens the island can be swallowed in a single tick — the mouse
-   * crosses the 6 px wake strip and leaves again before a frame is delivered —
-   * and with nothing animating the loop would park while the island is still
-   * mid-peek. A short window after every wake-up costs a few idle frames and
-   * removes a whole class of "the animation froze" report.
+   * `requestAnimationFrame` is not guaranteed to be delivered while the window is
+   * unmapped, so a wake-up can hand out a frame that never arrives. Two windows
+   * guard against that: a short grace period after every wake-up, and a longer
+   * one after a frame has thrown. See `stepFrameLoop`.
    */
   private watchdogUntil = 0;
   /** Counts frame failures, purely so the log cannot be flooded by a per-frame throw. */
@@ -762,37 +761,54 @@ export class Island {
       return;
     }
 
-    // A visible island must never park with work outstanding. `requestAnimationFrame`
-    // is also not guaranteed to be delivered while the window is unmapped, so the
-    // island kept a slow heartbeat alive; without it, a wake strip click that never
-    // produced a frame left the peek animation frozen half-open.
-    const settling = this.settling;
-    const busy = State.mode === "hidden"
-      ? settling
-      : settling || this.visibleBusy || this.watchdogUntil > nowMs;
-
-    if (busy) {
+    if (this.stepFrameLoop(nowMs)) {
       this.running = true;
       requestAnimationFrame(this.frame);
     } else {
       this.running = false;
       this.watchdogUntil = 0;
+      // A running AudioContext keeps its audio thread and render quantum alive
+      // even with nothing playing. The loop now parks only once the island is
+      // hidden, which is exactly when that state is worth entering.
       Sound.idle();
     }
   };
 
+  /**
+   * Whether another frame is needed, and the park decision itself.
+   *
+   * A visible island ticks at display refresh, always — the same contract as
+   * `TimelineView(.animation(paused: state.mode == .hidden))` on macOS
+   * (BotCanvasView.swift). It used to be a demand-driven loop that parked itself
+   * whenever nothing looked busy, which was wrong: Mochi's blinks, the badge
+   * dots pulse, the mini bots and the step ticker are all driven by wall-clock
+   * time rather than by a tween, so none of them were ever "busy" and the island
+   * froze the moment the pointer left. On Windows the 60 Hz cursor poll kept
+   * `ensureRunning` called and hid the flaw; on Linux there is no global cursor
+   * (`platform::CURSOR_POLL` is false), so the freeze was permanent until the
+   * pointer came back onto the notch.
+   *
+   * Only a hidden island parks, which is what keeps the promise in CLAUDE.md of
+   * no CPU at all while the island is not on screen.
+   */
+  private stepFrameLoop(nowMs: number): boolean {
+    if (State.mode !== "hidden") {
+      // Re-arm the grace window on every frame. rAF is not guaranteed while the
+      // window is unmapped, and a wake-up whose frame never arrives must not be
+      // able to strand the island mid-open.
+      this.watchdogUntil = Math.max(this.watchdogUntil, nowMs + 600);
+      return true;
+    }
+
+    // Hidden: nothing is drawn, so park as soon as the retract finishes. The
+    // grace window still applies, because the collapse can begin on a hover
+    // that never got a frame.
+    return this.settling || this.watchdogUntil > nowMs;
+  }
+
   /** Geometry springs still moving. */
   private get settling(): boolean {
     return this.width.animating || this.height.animating || this.radius.animating;
-  }
-
-  /** Per-frame work while the island is on screen. */
-  private get visibleBusy(): boolean {
-    return (
-      !this.botCx.settled || !this.botCy.settled || !this.botSize.settled ||
-      (State.mode === "expanded" && State.view === "greeting") ||
-      this.engine.busy || UploadSeq.isActive
-    );
   }
 
   /**
