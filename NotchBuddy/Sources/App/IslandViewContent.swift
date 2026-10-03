@@ -3283,14 +3283,14 @@ struct SettingsIslandView: View {
                         .foregroundColor(Color(hex: "#C5C8CD"))
                     Spacer()
                     HStack(spacing: 6) {
-                        ForEach([10, 15, 30], id: \.self) { s in
-                            Button("\(s)s") {
-                                state.autoCloseInterval = Double(s)
+                        ForEach(IslandConst.autoCloseChoices, id: \.self) { s in
+                            Button("\(Int(s))s") {
+                                state.autoCloseInterval = s
                             }
                             .font(.system(size: 11))
                             .padding(.horizontal, 7).padding(.vertical, 3)
-                            .background(state.autoCloseInterval == Double(s) ? Color(hex: "#252830") : Color.clear)
-                            .foregroundColor(state.autoCloseInterval == Double(s) ? Color(hex: "#F5F6F8") : Color(hex: "#6B7079"))
+                            .background(state.autoCloseInterval == s ? Color(hex: "#252830") : Color.clear)
+                            .foregroundColor(state.autoCloseInterval == s ? Color(hex: "#F5F6F8") : Color(hex: "#6B7079"))
                             .clipShape(Capsule())
                             .buttonStyle(.plain)
                         }

@@ -123,6 +123,34 @@ export const DEFAULT_SETTINGS: Settings = {
   model: "claude-opus-5",
 };
 
+/** Auto-close delays offered in the island settings card, in seconds.
+ *  Mirrors `IslandConst.autoCloseChoices` on macOS. */
+export const AUTO_CLOSE_CHOICES = [3, 5, 10, 15, 30];
+export const AUTO_CLOSE_MIN = 3;
+export const AUTO_CLOSE_MAX = 300;
+
+export function clampAutoClose(v: unknown, fallback = 15): number {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.max(AUTO_CLOSE_MIN, Math.min(AUTO_CLOSE_MAX, n));
+}
+
+/** True while this agent is actually doing something. Mirrors `BotState.isBusy`. */
+export function isBusyState(s: BotStateName): boolean {
+  switch (s) {
+    case "working":
+    case "thinking":
+    case "searching":
+    case "approval":
+    case "question":
+    case "error":
+    case "ratelimit":
+      return true;
+    default:
+      return false;
+  }
+}
+
 type Listener = () => void;
 
 class AppState {
@@ -177,6 +205,13 @@ class AppState {
 
   get effectiveState(): BotStateName {
     return this.stateOverride ?? this.focusTask?.state ?? "idle";
+  }
+
+  /** True while at least one agent is doing something. Drives auto-expand:
+   *  the island opens and stays open while work is in progress, and folds
+   *  once everything goes idle. Mirrors `AppState.hasActiveWork`. */
+  get hasActiveWork(): boolean {
+    return this.tasks.some((t) => isBusyState(t.state));
   }
 
   get otherTasks(): AgentTask[] {

@@ -12,9 +12,18 @@ final class IslandWindowController: NSWindowController {
     let fsm = IslandStateMachine()
 
     private var wasInIsland = false
+    /// Last sampled mouse position over the island, used to turn per-frame
+    /// cursor samples into discrete "the user moved" activity events.
+    private var lastActivityPos: CGPoint = .zero
+    /// Throttle for the auto-close restart, so a moving mouse does not re-arm the
+    /// timer on all 60 frames per second.
+    private var lastActivityReset: Date = .distantPast
+    /// Cached `AppState.hasActiveWork` so the 60 Hz poll only reacts to real edges.
+    private var lastBusy = false
     private var frameTimer: Timer?
     private var keyMonitor: Any?
     private var viewSubscription: AnyCancellable?
+    private var autoCloseSubscription: AnyCancellable?
 
     // Confused recovery timer (set by handleDizzy)
     private var confusedRecoveryTimer: DispatchWorkItem?
@@ -137,9 +146,10 @@ final class IslandWindowController: NSWindowController {
         container.addSubview(dropView)   // z-top: drag only (hitTest→nil, transparent to mouse)
         panel.contentView = container
 
+        // Before the poll: it reads `fsm` and `lastBusy` on its first frame.
+        wireFSM()
         startPolling()
         startKeyMonitor()
-        wireFSM()
 
         // Make panel key whenever the prompt/chat view becomes active
         // (nonactivatingPanel never auto-becomes key, but TextField needs it)
@@ -150,6 +160,18 @@ final class IslandWindowController: NSWindowController {
                 if newView == .prompt {
                     self.islandPanel.makeKey()
                 }
+            }
+
+        // The auto-close delay is a setting, so the FSM has to be rebound when
+        // Settings changes it — otherwise the pills only move the countdown bar.
+        autoCloseSubscription = state.$autoCloseInterval
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] seconds in
+                guard let self else { return }
+                self.fsm.homeToPetitDelay = seconds
+                // Re-arm so a delay shortened mid-countdown takes effect at once
+                // instead of after the previous, longer wait.
+                self.fsm.armAutoCollapse()
             }
     }
 
@@ -182,10 +204,10 @@ final class IslandWindowController: NSWindowController {
 
             case .home:
                 self.expand(to: self.defaultView())
-                // Start collapse timer if mouse not currently hovering
-                if !self.wasInIsland {
-                    self.fsm.mouseLeft()
-                }
+                // Arm the auto-close clock unconditionally. `mouseLeft()` only
+                // cancelled it when the cursor was away, which left a hovered
+                // island open forever — the delay has to be an inactivity timer.
+                self.fsm.armAutoCollapse()
 
             case .coucou:
                 self.expand(to: .greeting)
@@ -200,6 +222,11 @@ final class IslandWindowController: NSWindowController {
         }
 
         fsm.isHeldOpen = { AppState.shared.pendingApproval != nil }
+        // Live work holds the island open; idle lets the clock run.
+        fsm.isBusy = { AppState.shared.hasActiveWork }
+        // The auto-close delay is a user setting, so the FSM cannot keep its own
+        // constant. Rebound whenever Settings writes a new value.
+        fsm.homeToPetitDelay = AppState.shared.autoCloseInterval
     }
 
     // MARK: - 60 Hz polling loop
@@ -249,6 +276,17 @@ final class IslandWindowController: NSWindowController {
         // AppState can hide the island by itself (last task ended): keep the FSM in step.
         if state.mode == .hidden && fsm.state == .petit { fsm.hiddenExternally() }
 
+        // An agent starting or going idle is what decides expand vs. fold.
+        // Compared against a cached value so a 60 Hz poll does not call it 60×/s.
+        let busyNow = state.hasActiveWork
+        if busyNow != lastBusy {
+            lastBusy = busyNow
+            // The countdown bar starts from the moment work stopped, not from
+            // whenever the user last happened to move the mouse.
+            if !busyNow { state.lastActivity = .now }
+            fsm.busyStateChanged()
+        }
+
         // Feed FSM hover enter/leave
         if inIsland && !wasInIsland {
             guard !inAttachDrag else { wasInIsland = inIsland; return }
@@ -262,6 +300,23 @@ final class IslandWindowController: NSWindowController {
             fsm.mouseLeft()
         }
         wasInIsland = inIsland
+
+        // Moving the mouse over the open island counts as activity, so the
+        // auto-close delay is measured from the last movement rather than from
+        // the moment the island opened.
+        if inIsland, state.mode == .expanded,
+           abs(newPos.x - lastActivityPos.x) > 1 || abs(newPos.y - lastActivityPos.y) > 1 {
+            lastActivityPos = newPos
+            state.lastActivity = .now
+            // The timer is restarted at most a few times a second: at 60 Hz a
+            // moving mouse would otherwise cancel and re-arm a work item on
+            // every frame for no benefit, since the shortest delay is 3 s.
+            let now = Date.now
+            if now.timeIntervalSince(lastActivityReset) > 0.4 {
+                lastActivityReset = now
+                fsm.resetActivity()
+            }
+        }
 
         // Bot-head hover (love emote)
         let overBot = state.mode == .expanded && state.stateOverride == nil && isBotHit(local)
@@ -353,6 +408,9 @@ final class IslandWindowController: NSWindowController {
             setMode(.expanded)
         }
         state.lastActivity = .now
+        // Seed the movement tracker, otherwise the first frame after opening
+        // reads as a large jump and counts as activity before the user moved.
+        lastActivityPos = state.mousePosition
     }
 
     func collapse() {
@@ -375,6 +433,10 @@ final class IslandWindowController: NSWindowController {
                     if self.state.mode == .expanded && !self.state.isPinned {
                         self.collapse()
                     }
+                } else {
+                    // Typing is activity: the island must not fold mid-sentence.
+                    self.resetActivity()
+                    self.fsm.resetActivity()
                 }
             }
         }
@@ -418,6 +480,9 @@ final class IslandWindowController: NSWindowController {
             MainActor.assumeIsolated {
                 guard self.wasInIsland else { return }
                 self.pendingIslandClick = true
+                // A click is activity — restart the auto-close countdown.
+                self.resetActivity()
+                self.fsm.resetActivity()
                 self.hoverTimer?.cancel()
                 self.botHoverTimer?.cancel()
                 self.botHovering = false

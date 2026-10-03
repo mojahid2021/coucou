@@ -10,7 +10,7 @@ import {
   type IslandMode, type IslandViewName,
 } from "../core/layout";
 import { Sound } from "../core/sound";
-import { State } from "../core/state";
+import { State, clampAutoClose } from "../core/state";
 import { BotEngine, hexToRGB } from "../mochi/engine";
 import { Greeting } from "../mochi/greeting";
 import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
@@ -85,6 +85,13 @@ export class Island {
   /** Last shape handed to Rust for the click-through test. */
   private pushedRect = { x: -1, y: -1, w: -1, h: -1 };
   private homeCollapseAt: number | null = null;
+  /** Last cursor position over the island, used to turn per-frame cursor samples
+   *  into discrete "the user moved" activity events. */
+  private lastActivityPt = { x: 0, y: 0 };
+  /** Throttle for the auto-close restart on the 60 Hz cursor poll. */
+  private lastActivityReset = 0;
+  /** Cached `State.hasActiveWork` so a 60 Hz cursor poll only reacts to real edges. */
+  private lastBusy = false;
 
   // Bot hover → love (IslandWindowController.botHoverIn)
   private botHovering = false;
@@ -177,8 +184,9 @@ export class Island {
         State.notify();
       },
       setAutoClose: (s) => {
-        State.settings.autoCloseInterval = s;
-        this.fsm.homeToPetitDelay = s;
+        State.settings.autoCloseInterval = clampAutoClose(s);
+        this.fsm.homeToPetitDelay = State.settings.autoCloseInterval;
+        this.armCollapseCountdown();
         void Bridge.saveSettings(State.settings);
         State.notify();
       },
@@ -242,6 +250,7 @@ export class Island {
 
   private wireFsm() {
     this.fsm.homeToPetitDelay = State.settings.autoCloseInterval;
+    this.fsm.isBusy = () => State.hasActiveWork;
     this.fsm.onTransition = (from, to) => {
       switch (to) {
         case "hidden":
@@ -256,7 +265,10 @@ export class Island {
           break;
         case "home":
           this.expand(State.defaultView());
-          if (!this.wasInIsland) this.fsm.mouseLeft();
+          // Arm the auto-close clock unconditionally. `mouseLeft()` only
+          // cancelled it when the cursor was away, which left a hovered island
+          // open forever — the delay has to be an inactivity timer.
+          this.fsm.armAutoCollapse();
           break;
         case "coucou":
           this.expand("greeting");
@@ -280,7 +292,12 @@ export class Island {
     if (mode === "expanded") Sound.play("open");
     if (prev === "expanded") {
       Sound.play("close");
-      State.isPinned = false;
+      // A pending alert owns its pin. Clearing it here meant any transition out
+      // of expanded could strip a live approval of its no-auto-close guarantee.
+      if (!State.pendingApproval) {
+        State.isPinned = false;
+        this.fsm.pinned = false;
+      }
       void Bridge.focusWindow(false);
     }
     if (mode !== "expanded") {
@@ -311,7 +328,10 @@ export class Island {
     if (State.mode !== "expanded") this.setMode("expanded");
     else this.animateGeometry(false);
     State.lastActivity = performance.now();
-    this.homeCollapseAt = null;
+    // Seed the movement tracker, otherwise the first frame after opening reads as
+    // a large jump and counts as activity before the user moved.
+    this.lastActivityPt = { x: State.mouse.x, y: State.mouse.y };
+    this.armCollapseCountdown();
     State.notify();
   }
 
@@ -327,6 +347,7 @@ export class Island {
     const grew = VIEW_LAYOUTS[view].height >= VIEW_LAYOUTS[State.view].height;
     State.view = view;
     State.lastActivity = performance.now();
+    this.armCollapseCountdown();
     this.animateGeometry(!grew);
     State.notify();
   }
@@ -558,9 +579,24 @@ export class Island {
     const wasInside = this.wasInIsland;
     this.wasInIsland = false;
     this.fsm.mouseLeft();
-    if (wasInside && this.fsm.state === "home" && !State.isPinned) {
-      this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
+    if (wasInside) this.armCollapseCountdown();
+  }
+
+  /**
+   * Starts (or restarts) the auto-close clock: the FSM timeout that folds the
+   * island, and `homeCollapseAt` that drives the countdown bar.
+   *
+   * The two used to be armed from different places — the FSM from `mouseLeft()`
+   * and the bar from `expand()` — which is how a hovered island ended up with a
+   * bar that never emptied. One entry point keeps them in step.
+   */
+  private armCollapseCountdown() {
+    if (this.fsm.state !== "home" || State.isPinned || State.hasActiveWork) {
+      this.homeCollapseAt = null;
+      return;
     }
+    this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
+    this.fsm.armAutoCollapse();
   }
 
   private wireInput() {
@@ -594,7 +630,7 @@ export class Island {
       this.wasInIsland = true;
       this.watchdogUntil = performance.now() + 600;
       this.fsm.mouseEntered();
-      this.homeCollapseAt = null;
+      this.armCollapseCountdown();
     });
     this.islandEl.addEventListener("mouseleave", () => this.markMouseOutside());
 
@@ -605,6 +641,8 @@ export class Island {
         this.fsm.click();
         return;
       }
+      // A click is activity: restart the auto-close countdown.
+      this.armCollapseCountdown();
       if (this.isBotHit(e.clientX, e.clientY)) {
         this.cancelBotHover();
         this.engine.slap();
@@ -614,6 +652,8 @@ export class Island {
     window.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && State.mode === "expanded" && !State.isPinned) this.collapse();
       State.lastActivity = performance.now();
+      // Typing is activity: the island must not fold mid-sentence.
+      if (e.key !== "Escape") this.armCollapseCountdown();
     });
 
     void onDragDrop((e) => this.onDragDrop(e));
@@ -655,10 +695,27 @@ export class Island {
     if (inIsland && !this.wasInIsland) {
       if (this.fsm.state === "coucou") this.greeting.hover();
       this.fsm.mouseEntered();
-      this.homeCollapseAt = null;
+      this.armCollapseCountdown();
     }
     if (!inIsland && this.wasInIsland) this.markMouseOutside();
     this.wasInIsland = inIsland;
+
+    // Moving the mouse over the open island counts as activity, so the delay is
+    // measured from the last movement rather than from when the island opened.
+    if (inIsland && State.mode === "expanded" && !State.hasActiveWork) {
+      const moved = Math.hypot(x - this.lastActivityPt.x, y - this.lastActivityPt.y) > 1;
+      if (moved) {
+        this.lastActivityPt = { x, y };
+        State.lastActivity = performance.now();
+        // Restart the timer at most a few times a second: on the 60 Hz cursor
+        // poll a moving mouse would otherwise re-arm it every frame, for no
+        // benefit, since the shortest delay is 3 s.
+        if (performance.now() - this.lastActivityReset > 400) {
+          this.lastActivityReset = performance.now();
+          this.armCollapseCountdown();
+        }
+      }
+    }
 
     // Bot hover → love
     const overBot = State.mode === "expanded" && State.stateOverride == null && this.isBotHit(x, y);
@@ -856,7 +913,23 @@ export class Island {
     tickMiniBots(dt);
     this.views.get(State.view)?.tick?.(nowMs);
     if (UploadSeq.isActive) this.stepSequence();
+    this.syncBusy();
     this.updateCountdown(nowMs);
+  }
+
+  /**
+   * An agent starting or going idle is what decides expand vs. fold.
+   * Compared against a cached value so a 60 Hz frame does not call it 60×/s.
+   */
+  private syncBusy() {
+    const busy = State.hasActiveWork;
+    if (busy === this.lastBusy) return;
+    this.lastBusy = busy;
+    // The countdown bar starts when work stops, not from whenever the user last
+    // happened to move the mouse.
+    if (!busy) State.lastActivity = performance.now();
+    this.fsm.busyStateChanged();
+    this.armCollapseCountdown();
   }
 
   /** One line in the log, at most a few times, so a per-frame throw cannot flood it. */
@@ -948,7 +1021,10 @@ export class Island {
   }
 
   private updateCountdown(nowMs: number) {
-    if (State.mode !== "expanded" || State.isPinned || this.homeCollapseAt == null) {
+    // No bar while an alert is pinned or work is running: the FSM holds the
+    // island open in both cases, so a draining bar would be a lie.
+    if (State.mode !== "expanded" || State.isPinned || State.hasActiveWork
+        || this.homeCollapseAt == null) {
       this.countdown.style.width = "0px";
       return;
     }
@@ -1014,6 +1090,9 @@ export class Island {
     Sound.setEnabled(State.settings.soundEnabled);
     Sound.setVolume(State.settings.soundVolume);
     this.fsm.homeToPetitDelay = State.settings.autoCloseInterval;
+    // Re-arm so a delay shortened mid-countdown takes effect at once instead of
+    // after the previous, longer wait.
+    this.armCollapseCountdown();
     State.notify();
   }
 

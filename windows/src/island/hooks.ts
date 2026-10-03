@@ -204,7 +204,8 @@ function handleHook(island: Island, payload: HookPayload) {
 
   const focused = State.focusId === agentId;
 
-  /** Alerts force the island open; work events only reveal the compact island. */
+  /** Alerts force the island open. Work events open the card too while an agent is
+   *  actually busy, and only peek compact when nothing is running. */
   const surface = (view: Parameters<Island["alert"]>[0], isAlert: boolean) => {
     if (State.mode === "expanded") {
       if (isAlert) island.setView(view);

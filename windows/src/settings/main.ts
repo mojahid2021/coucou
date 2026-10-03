@@ -5,7 +5,9 @@
 
 import "./settings.css";
 import { Bridge, onEvent, type HookStatus, type HookTarget } from "../core/bridge";
-import { DEFAULT_SETTINGS, type Settings } from "../core/state";
+import {
+  AUTO_CLOSE_MAX, AUTO_CLOSE_MIN, DEFAULT_SETTINGS, clampAutoClose, type Settings,
+} from "../core/state";
 import { h, clear } from "../views/dom";
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
@@ -405,12 +407,12 @@ function generalSection(): HTMLElement {
   });
 
   const autoClose = h("input", {
-    type: "number", min: "5", max: "120", step: "1",
+    type: "number", min: String(AUTO_CLOSE_MIN), max: String(AUTO_CLOSE_MAX), step: "1",
     value: String(Math.round(settings.autoCloseInterval)),
     style: "width:72px",
   }) as HTMLInputElement;
   autoClose.addEventListener("change", () => {
-    settings.autoCloseInterval = Math.max(5, Math.min(120, Number(autoClose.value) || 15));
+    settings.autoCloseInterval = clampAutoClose(autoClose.value);
     autoClose.value = String(settings.autoCloseInterval);
     void save();
   });

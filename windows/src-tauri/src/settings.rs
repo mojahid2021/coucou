@@ -64,16 +64,37 @@ fn settings_path() -> PathBuf {
 }
 
 pub fn load() -> Settings {
-    match std::fs::read(settings_path()) {
+    let mut s = match std::fs::read(settings_path()) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Settings::default(),
+    };
+    s.clamp();
+    s
+}
+
+/// Keeps the auto-close delay inside the range the UI offers. A 0 here would
+/// collapse the island the instant it opened, and a hand-edited settings.json
+/// must not be able to do that either. Mirrors `clampAutoClose` in state.ts.
+fn clamp_range() -> (f64, f64) {
+    (3.0, 300.0)
+}
+
+impl Settings {
+    pub fn clamp(&mut self) {
+        let (lo, hi) = clamp_range();
+        if !self.auto_close_interval.is_finite() || self.auto_close_interval <= 0.0 {
+            self.auto_close_interval = 15.0;
+        }
+        self.auto_close_interval = self.auto_close_interval.clamp(lo, hi);
     }
 }
 
 pub fn save(settings: &Settings) -> std::io::Result<()> {
     let dir = config_dir();
     crate::platform::ensure_private_dir(&dir)?;
-    let json = serde_json::to_vec_pretty(settings)
+    let mut settings = settings.clone();
+    settings.clamp();
+    let json = serde_json::to_vec_pretty(&settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(settings_path(), json)
 }

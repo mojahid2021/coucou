@@ -151,8 +151,22 @@ final class AppState: ObservableObject {
 
     // Auto-close delay — persisted
     @Published var autoCloseInterval: TimeInterval = 15 {
-        didSet { UserDefaults.standard.set(autoCloseInterval, forKey: "autoCloseInterval") }
+        // Clamped on the way in, not just at the UI: the value is also restored
+        // from UserDefaults, and a 0 would collapse the island the instant it
+        // opened. Swift does not re-enter didSet for a self-assignment, so the
+        // clamped value still gets persisted by the assignment below.
+        didSet {
+            let clamped = min(max(autoCloseInterval, IslandConst.autoCloseRange.lowerBound),
+                              IslandConst.autoCloseRange.upperBound)
+            if clamped != autoCloseInterval { autoCloseInterval = clamped }
+            UserDefaults.standard.set(autoCloseInterval, forKey: "autoCloseInterval")
+        }
     }
+
+    /// True while at least one agent is doing something. Drives auto-expand:
+    /// the island opens and stays open while work is in progress, and folds
+    /// once everything goes idle.
+    var hasActiveWork: Bool { tasks.contains { $0.state.isBusy } }
 
     // Absence interval — persisted
     var absenceInterval: TimeInterval = 3 * 60 {
@@ -260,6 +274,8 @@ final class AppState: ObservableObject {
         if let v = ud.object(forKey: "autoCloseInterval") as? Double {
             autoCloseInterval = (v == 60) ? 15 : v
         }
+        autoCloseInterval = min(max(autoCloseInterval, IslandConst.autoCloseRange.lowerBound),
+                                IslandConst.autoCloseRange.upperBound)
         if let v = ud.object(forKey: "absenceInterval")   as? Double { absenceInterval   = v }
         if let v = ud.object(forKey: "greetThreshold")    as? Double { greetThresholdSeconds = v }
         if let v = ud.object(forKey: "hotkeyEnabled") as? Bool  { hotkeyEnabled = v }

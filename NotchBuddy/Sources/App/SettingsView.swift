@@ -490,11 +490,14 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
                             Text("Close after")
-                            TextField("60", value: $state.autoCloseInterval, format: .number)
+                            TextField("15", value: $state.autoCloseInterval, format: .number)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 64)
                             Text("s inactive")
                         }
+                        Text("While an agent is working the island stays open and never counts down.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
                         HStack(spacing: 8) {
                             Text("Hide after")
                             TextField("3", value: absenceMinutes, format: .number)

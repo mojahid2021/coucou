@@ -22,6 +22,22 @@ enum BotState: String, CaseIterable {
     case ratelimit, sleeping, dizzy
 }
 
+// MARK: - Busy states
+
+extension BotState {
+    /// True while this agent is actually doing something, so the island stays
+    /// expanded. `finished` is excluded: it is a terminal state that goes `idle`
+    /// on its own a few seconds later, and the island should start folding then.
+    var isBusy: Bool {
+        switch self {
+        case .working, .thinking, .searching, .approval, .question, .error, .ratelimit:
+            return true
+        case .idle, .finished, .sleeping, .dizzy:
+            return false
+        }
+    }
+}
+
 // MARK: - Bot Emote
 
 enum BotEmote: String, CaseIterable {
@@ -130,6 +146,12 @@ enum IslandConst {
     static let earRadius: CGFloat   = 14
     static let roundedCorner: CGFloat = 14    // hidden/peek/compact
     static let expandedCorner: CGFloat = 22
+
+    /// Auto-close delays offered in the island settings card, in seconds.
+    /// One list so the pills, the "Close after" field and the clamp in
+    /// AppState can never disagree about which values exist.
+    static let autoCloseChoices: [TimeInterval] = [3, 5, 10, 15, 30]
+    static let autoCloseRange: ClosedRange<TimeInterval> = 3...300
 
     static let viewLayouts: [IslandView: ViewLayout] = [
         // Home is the reference: height 150
