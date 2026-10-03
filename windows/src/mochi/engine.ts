@@ -4,7 +4,7 @@
 // (design/prototype/notch-buddy.html, the visual source of truth) — the Swift
 // arc angles produce a different shape.
 
-import { Ease, lerp, type EaseFn } from "../core/anim";
+import { Ease, lerp, clamp, type EaseFn } from "../core/anim";
 import { Sound } from "../core/sound";
 import type { BotEmoteName, BotStateName } from "../core/layout";
 
@@ -50,6 +50,8 @@ interface BotStateCfg {
   sweat: boolean;
   look: readonly [number, number] | null;
   tilt: number;
+  /** Slow weight shift on the tilt axis. Only idle-ish states set this. */
+  sway: number;
 }
 
 interface Particle {
@@ -85,11 +87,21 @@ const C = {
 
 const base = {
   bounces: false, scans: false, breathes: false, zz: false, sweat: false,
-  look: null, tilt: 0,
+  look: null, tilt: 0, sway: 0,
 };
 
+// Idle amplitudes are deliberately far below anything a working state does, so
+// a resting Mochi reads as alive without ever looking busy.
+const IDLE_SWAY = 0.028;
+const IDLE_SWAY_HZ = 1 / 5.5;
+const IDLE_GLANCE_MIN = 4.5;
+const IDLE_GLANCE_MAX = 9;
+/** Seconds of `thinking` before the first finger-tap, and between taps. */
+const THINK_TAP_AFTER = 4;
+const THINK_TAP_EVERY = 3.2;
+
 export const BOT_STATES: Record<BotStateName, BotStateCfg> = {
-  idle: { ...base, color: C.idle, tint: 0, eye: "pill", badge: null },
+  idle: { ...base, color: C.idle, tint: 0, eye: "pill", badge: null, breathes: true, sway: IDLE_SWAY },
   working: { ...base, color: C.working, tint: 0.72, eye: "pill", badge: { kind: "dots", color: C.working } },
   thinking: { ...base, color: C.thinking, tint: 0.72, eye: "pill", badge: { kind: "dots", color: C.thinking }, look: [0.55, 0.55] },
   searching: { ...base, color: C.searching, tint: 0.72, eye: "pill", badge: { kind: "dots", color: C.searching }, scans: true },
@@ -109,10 +121,199 @@ export const STATE_SOUND: Partial<Record<BotStateName, string>> = {
   sleeping: "sleep", dizzy: "dizzy",
 };
 
-const EMOTE_EYE: Record<BotEmoteName, EyeShape> = {
-  love: "heart", surprised: "dot", proud: "star", wink: "wink",
-  yawn: "tired", happy: "happy", annoyed: "line",
+/**
+ * What an emote does, in one place.
+ *
+ * Adding an emote used to mean editing six places by name: the `BotEmoteName`
+ * union, `EMOTE_EYE`, the `triggerEmote` switch, `setPermanentEmote`, the mini
+ * behaviour loop, and `SOUND_NAMES`. Only the first was a compile error — the
+ * rest failed silently, which is how `greet()` and `sleeping` were found dead in
+ * this codebase. Now the eye shape and the sound live here too, and a test
+ * asserts the table covers the union.
+ *
+ * `run` receives the duration in **seconds** because every emote's keyframe
+ * arithmetic was written against `duration` that way (`(duration - 0.6) * 1000`).
+ * `annoyed` also overrides its own eye and duration, exactly as before.
+ */
+interface EmoteSpec {
+  eye: EyeShape;
+  /** Sound file name, if this emote has one. Checked against `SoundName`. */
+  sound?: string;
+  /** True when a mini pill loops this emote instead of idling. */
+  loopsOnMini?: boolean;
+  run(e: BotEngine, duration: number): void;
+  /** One shot of the mini loop. Omitted means "not looped". */
+  mini?: (e: BotEngine, at: number) => number | void;
+}
+
+export const EMOTE_SPECS: Record<BotEmoteName, EmoteSpec> = {
+  love: {
+    eye: "heart",
+    sound: "love",
+    loopsOnMini: true,
+    run(e, duration) {
+      e.anim("blush", [
+        [1, 300, Ease.out], [1, (duration - 0.6) * 1000, Ease.lin], [0, 300, Ease.inOut],
+      ]);
+      e.emit("heart", 4);
+      e.anim("oy", [[-0.1, 160, Ease.out], [0, 300, Ease.back]]);
+    },
+    mini(e, at) {
+      e.emit("heart", 2);
+      e.anim("tilt", [[-0.1, 180, Ease.out], [0.1, 340, Ease.inOut], [0, 220, Ease.inOut]]);
+      return at + 2.6 + Math.random() * 1.5;
+    },
+  },
+
+  surprised: {
+    eye: "dot",
+    sound: "pop",
+    run(e) {
+      e.anim("oy", [[-0.3, 140, Ease.out], [0, 380, Ease.back]]);
+      e.anim("es", [[1.25, 120, Ease.out], [1, 500, Ease.inOut]]);
+    },
+  },
+
+  proud: {
+    eye: "star",
+    sound: "proud",
+    run(e, duration) {
+      e.emit("star", 5);
+      e.anim("tilt", [
+        [-0.14, 220, Ease.out], [-0.14, (duration - 0.5) * 1000, Ease.lin], [0, 280, Ease.inOut],
+      ]);
+      e.anim("blush", [
+        [0.7, 250, Ease.out], [0.7, (duration - 0.5) * 1000, Ease.lin], [0, 300, Ease.inOut],
+      ]);
+    },
+  },
+
+  wink: {
+    eye: "wink",
+    sound: "wink",
+    loopsOnMini: true,
+    run(e, duration) {
+      e.anim("tilt", [
+        [0.12, 160, Ease.out], [0.12, (duration - 0.4) * 1000, Ease.lin], [0, 240, Ease.inOut],
+      ]);
+    },
+    mini(e, at) {
+      e.eyeOverride = "wink";
+      e.eyeOverrideUntil = at + 0.55;
+      e.anim("tilt", [[0.13, 100, Ease.out], [0.13, 320, Ease.lin], [0, 200, Ease.inOut]]);
+      return at + 2.2 + Math.random() * 2.0;
+    },
+  },
+
+  yawn: {
+    eye: "tired",
+    sound: "yawn",
+    run(e) {
+      e.anim("sy", [[1.12, 500, Ease.inOut], [1, 500, Ease.inOut]]);
+      e.anim("sx", [[0.94, 500, Ease.inOut], [1, 500, Ease.inOut]]);
+      setTimeout(() => { e.eyeOverride = "closed"; e.emit("z", 2); }, 700);
+    },
+  },
+
+  happy: {
+    eye: "happy",
+    loopsOnMini: true,
+    run(e) {
+      e.anim("blush", [[0.6, 200, Ease.out], [0, 600, Ease.inOut]]);
+    },
+    mini(e, at) {
+      if (e.isAnimating("oy")) return at + 0.4;
+      e.anim("oy", [[-0.3, 120, Ease.out], [0.03, 200, Ease.inOut], [0, 160, Ease.back]]);
+      e.anim("sy", [[0.82, 80, Ease.out], [1.18, 130, Ease.out], [0.88, 160, Ease.inOut], [1, 200, Ease.back]]);
+      e.anim("sx", [[1.15, 80, Ease.out], [0.88, 130, Ease.out], [1.06, 160, Ease.inOut], [1, 200, Ease.back]]);
+      return at + 2.2 + Math.random() * 1.2;
+    },
+  },
+
+  // New in this pass. Neither needs a new EyeShape or a new particle type —
+  // both are an existing eye plus keyframes, which is why the draw code is
+  // untouched. See EMOTE_SPECS for why that matters.
+
+  curious: {
+    // A head tilt and a look up-and-aside: "what's that?" Used when a new agent
+    // pill turns up while the island is already open, which used to happen in
+    // silence.
+    eye: "pill",
+    sound: "blip",
+    run(e, duration) {
+      e.anim("tilt", [
+        [-0.12, 240, Ease.out], [-0.12, (duration - 0.45) * 1000, Ease.lin], [0, 260, Ease.inOut],
+      ]);
+      e.anim("yaw", [[0.34, 280, Ease.out], [0.34, (duration - 0.5) * 1000, Ease.lin], [0, 300, Ease.inOut]]);
+      // A single blink partway through sells the "looked over" beat.
+      setTimeout(() => e.blink(), 320);
+    },
+  },
+
+  celebrate: {
+    // A bigger `happy`: jump, sparkle burst and a blush held longer. Reserved
+    // for a multi-step task finishing, so a one-line edit does not throw a
+    // party. `happy` stays the small post-decision blush.
+    eye: "star",
+    sound: "proud",
+    loopsOnMini: true,
+    run(e, duration) {
+      e.emit("spark", 6);
+      e.emit("star", 3);
+      e.anim("oy", [
+        [-0.26, 130, Ease.out], [0.05, 190, Ease.inOut], [0, 220, Ease.back],
+      ]);
+      e.anim("sy", [[0.86, 90, Ease.out], [1.16, 140, Ease.out], [0.92, 160, Ease.inOut], [1, 210, Ease.back]]);
+      e.anim("sx", [[1.12, 90, Ease.out], [0.9, 140, Ease.out], [1.05, 160, Ease.inOut], [1, 210, Ease.back]]);
+      e.anim("blush", [
+        [0.8, 200, Ease.out], [0.8, (duration - 0.55) * 1000, Ease.lin], [0, 320, Ease.inOut],
+      ]);
+    },
+    mini(e, at) {
+      e.emit("spark", 3);
+      e.anim("oy", [[-0.22, 110, Ease.out], [0.04, 170, Ease.inOut], [0, 190, Ease.back]]);
+      return at + 3.0 + Math.random() * 1.8;
+    },
+  },
+
+  annoyed: {
+    eye: "line",
+    sound: "annoyed",
+    loopsOnMini: true,
+    /** Overrides `eye` and the caller's duration, as it always has. */
+    run(e, _duration) {
+      e.eyeOverride = "line";
+      e.eyeOverrideUntil = now() + 0.8;
+      setTimeout(() => Sound.play("annoyed"), 60);
+    },
+    mini(e, at) {
+      if (e.isAnimating("yaw")) return at + 0.5;
+      e.anim("yaw", [
+        [-0.65, 50, Ease.out], [0.65, 90, Ease.inOut], [-0.5, 80, Ease.inOut],
+        [0.4, 75, Ease.inOut], [-0.2, 70, Ease.inOut], [0, 140, Ease.out],
+      ]);
+      return at + 3.0 + Math.random() * 2.5;
+    },
+  },
 };
+
+/** Eye shape per emote, derived from the table so it has exactly one home. */
+export const EMOTE_EYE: Record<BotEmoteName, EyeShape> = (() => {
+  const out = {} as Record<BotEmoteName, EyeShape>;
+  for (const [name, spec] of Object.entries(EMOTE_SPECS) as [BotEmoteName, EmoteSpec][]) {
+    out[name] = spec.eye;
+  }
+  return out;
+})();
+
+/** The sound an emote plays, if any. Derived from the table, never repeated. */
+export const EMOTE_SOUND: Partial<Record<BotEmoteName, string>> = (() => {
+  const out: Partial<Record<BotEmoteName, string>> = {};
+  for (const [name, spec] of Object.entries(EMOTE_SPECS) as [BotEmoteName, EmoteSpec][]) {
+    if (spec.sound) out[name] = spec.sound;
+  }
+  return out;
+})();
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
 
@@ -199,6 +400,13 @@ export class BotEngine {
   private badgeKey = "none";
   private badgeToken = 0;
 
+  /** True while a tween owns this property. A new animation must not fight one
+   *  already running — that is how a mini ends up twitching between two emotes.
+   *  Narrow on purpose: the lock set itself stays private. */
+  isAnimating(prop: PropKey): boolean {
+    return this.locks.has(prop);
+  }
+
   private tweens = new Map<PropKey, Tween>();
   private locks = new Set<PropKey>();
   private particles: Particle[] = [];
@@ -216,6 +424,13 @@ export class BotEngine {
   private slapTimes: number[] = [];
   private miniLookTarget = { x: 0, y: 0 };
   private miniLookNextTime = 0;
+  /** Idle-life glance: when it starts, how long it lasts, and which way. */
+  private nextGlance = 0;
+  private glanceUntil = 0;
+  private glanceSide = 1;
+  /** Finger-tap: when thinking began, and when the next tap is due. */
+  private thinkSince = 0;
+  private nextThinkTap = 0;
 
   /** Fired when three slaps land inside 1.7 s (→ dizzy + confused view). */
   onDizzy: (() => void) | null = null;
@@ -381,47 +596,46 @@ export class BotEngine {
     const t = now();
     this.eyeOverride = EMOTE_EYE[emote];
     this.eyeOverrideUntil = t + duration;
+    EMOTE_SPECS[emote].run(this, duration);
+  }
 
-    switch (emote) {
-      case "love":
-        this.anim("blush", [
-          [1, 300, Ease.out], [1, (duration - 0.6) * 1000, Ease.lin], [0, 300, Ease.inOut],
-        ]);
-        this.emit("heart", 4);
-        this.anim("oy", [[-0.1, 160, Ease.out], [0, 300, Ease.back]]);
-        break;
-      case "surprised":
-        this.anim("oy", [[-0.3, 140, Ease.out], [0, 380, Ease.back]]);
-        this.anim("es", [[1.25, 120, Ease.out], [1, 500, Ease.inOut]]);
-        break;
-      case "proud":
-        this.emit("star", 5);
-        this.anim("tilt", [
-          [-0.14, 220, Ease.out], [-0.14, (duration - 0.5) * 1000, Ease.lin], [0, 280, Ease.inOut],
-        ]);
-        this.anim("blush", [
-          [0.7, 250, Ease.out], [0.7, (duration - 0.5) * 1000, Ease.lin], [0, 300, Ease.inOut],
-        ]);
-        break;
-      case "wink":
-        this.anim("tilt", [
-          [0.12, 160, Ease.out], [0.12, (duration - 0.4) * 1000, Ease.lin], [0, 240, Ease.inOut],
-        ]);
-        break;
-      case "yawn":
-        this.anim("sy", [[1.12, 500, Ease.inOut], [1, 500, Ease.inOut]]);
-        this.anim("sx", [[0.94, 500, Ease.inOut], [1, 500, Ease.inOut]]);
-        setTimeout(() => { this.eyeOverride = "closed"; this.emit("z", 2); }, 700);
-        break;
-      case "happy":
-        this.anim("blush", [[0.6, 200, Ease.out], [0, 600, Ease.inOut]]);
-        break;
-      case "annoyed":
-        this.eyeOverride = "line";
-        this.eyeOverrideUntil = t + 0.8;
-        setTimeout(() => Sound.play("annoyed"), 60);
-        break;
+  /**
+   * A quiet "still thinking" signal: a small tap of the mouth every few seconds
+   * once `thinking` has run for a while.
+   *
+   * The `thinking` state already looks up-and-right, which says "working on it"
+   * once. This says it again, more quietly, when the wait gets long — so a
+   * genuinely slow turn does not read as a frozen app. Deliberately not an
+   * emote: it repeats on a timer rather than firing once, and it must never
+   * interrupt an emote, a wave, or the drop sequence.
+   */
+  private updateThinkTap(n: number) {
+    if (this.state !== "thinking") {
+      this.thinkSince = 0;
+      this.nextThinkTap = 0;
+      return;
     }
+    if (this.thinkSince === 0) {
+      this.thinkSince = n;
+      // Nothing for the first stretch — an instant tap would read as a glitch.
+      this.nextThinkTap = n + THINK_TAP_AFTER;
+      return;
+    }
+    if (n < this.nextThinkTap) return;
+
+    // Only when the character is otherwise idle: a tap during an emote or the
+    // wave would restart that tween and cut it off. The mouth slot is driven by
+    // a spring rather than a tween, so it is never "locked" — the target is
+    // nudged below instead.
+    if (this.isAnimating("hands") || this.eyeOverride) {
+      this.nextThinkTap = n + 1;
+      return;
+    }
+    // Nudge the mouth spring rather than animating `slotH`: the spring owns that
+    // value, and a tween on it would fight the spring every frame.
+    this.slotHTarget = 0.16;
+    setTimeout(() => { this.slotHTarget = 0; }, 220);
+    this.nextThinkTap = n + THINK_TAP_EVERY;
   }
 
   emit(type: Particle["type"], count: number) {
@@ -518,8 +732,31 @@ export class BotEngine {
     if (this.state === "sleeping") { ty = 0; tp = -0.14; }
     if (this.state === "dizzy") { ty = Math.sin(t * 9) * 0.25; }
 
-    // Mini bots never follow the mouse — they wander.
-    if (this.isMini && !this.cfg.look && !this.cfg.scans && this.state !== "sleeping" && this.state !== "dizzy") {
+    // Idle life: a slow weight shift plus an occasional glance away. Only runs
+    // when nothing is driving the look target, so a busy state or a user who is
+    // actually moving the mouse always wins. `glanceAt` is re-armed on the far
+    // side of the swing so the character never snaps back mid-glance.
+    const freeLook = !this.cfg.look && !this.cfg.scans &&
+      this.state !== "sleeping" && this.state !== "dizzy" && !this.isMini;
+    if (freeLook) {
+      if (n > this.nextGlance) {
+        this.glanceSide = Math.random() < 0.5 ? -1 : 1;
+        this.glanceUntil = n + 0.8 + Math.random() * 0.7;
+        this.nextGlance = this.glanceUntil + IDLE_GLANCE_MIN + Math.random() * (IDLE_GLANCE_MAX - IDLE_GLANCE_MIN);
+      }
+      if (n < this.glanceUntil) {
+        // Ease in and out of the glance so it reads as a look, not a jump.
+        const p = clamp((this.glanceUntil - n) / 0.5, 0, 1);
+        const g = Math.sin(Math.PI * (1 - p)) * this.glanceSide * 0.5;
+        ty = ty * 0.35 + g * 0.62;
+      }
+    }
+
+    // Mini bots never follow the mouse — they wander on their own clock.
+    // `freeLook` is false for them (it requires !isMini), so the user looking
+    // around never competes with the wander.
+    if (this.isMini && !this.cfg.look && !this.cfg.scans
+        && this.state !== "sleeping" && this.state !== "dizzy") {
       if (n > this.miniLookNextTime) {
         this.miniLookTarget = {
           x: -0.88 + Math.random() * 1.76,
@@ -534,6 +771,11 @@ export class BotEngine {
     this.tgYaw = ty;
     this.tgPitch = tp;
     this.tgTilt = this.cfg.tilt;
+
+    // Weight shift, layered under the wave tilt so a greeting still reads.
+    if (this.cfg.sway > 0) {
+      this.tgTilt += Math.sin(2 * Math.PI * IDLE_SWAY_HZ * t) * this.cfg.sway;
+    }
 
     if (n > this.waveStart && n < this.waveUntil) {
       const wt = n - this.waveStart;
@@ -587,6 +829,8 @@ export class BotEngine {
       if (!this.isMini && this.cfg.sweat && Math.random() < 0.5) this.emit("sweat", 1);
     }
 
+    this.updateThinkTap(n);
+
     for (const p of this.particles) p.age += dt;
     this.particles = this.particles.filter((p) => p.age < p.life);
 
@@ -602,35 +846,35 @@ export class BotEngine {
 
   private doMiniBehaviorLoop() {
     const n = now();
-    switch (this.permanentEmote) {
-      case "happy":
-        if (this.locks.has("oy")) { this.miniNextBehavior = n + 0.4; return; }
-        this.anim("oy", [[-0.3, 120, Ease.out], [0.03, 200, Ease.inOut], [0, 160, Ease.back]]);
-        this.anim("sy", [[0.82, 80, Ease.out], [1.18, 130, Ease.out], [0.88, 160, Ease.inOut], [1, 200, Ease.back]]);
-        this.anim("sx", [[1.15, 80, Ease.out], [0.88, 130, Ease.out], [1.06, 160, Ease.inOut], [1, 200, Ease.back]]);
-        this.miniNextBehavior = n + 2.2 + Math.random() * 1.2;
-        break;
-      case "annoyed":
-        if (this.locks.has("yaw")) { this.miniNextBehavior = n + 0.5; return; }
-        this.anim("yaw", [
-          [-0.65, 50, Ease.out], [0.65, 90, Ease.inOut], [-0.5, 80, Ease.inOut],
-          [0.4, 75, Ease.inOut], [-0.2, 70, Ease.inOut], [0, 140, Ease.out],
-        ]);
-        this.miniNextBehavior = n + 3.0 + Math.random() * 2.5;
-        break;
-      case "wink":
-        this.eyeOverride = "wink";
-        this.eyeOverrideUntil = n + 0.55;
-        this.anim("tilt", [[0.13, 100, Ease.out], [0.13, 320, Ease.lin], [0, 200, Ease.inOut]]);
-        this.miniNextBehavior = n + 2.2 + Math.random() * 2.0;
-        break;
-      case "love":
-        this.emit("heart", 2);
-        this.anim("tilt", [[-0.1, 180, Ease.out], [0.1, 340, Ease.inOut], [0, 220, Ease.inOut]]);
-        this.miniNextBehavior = n + 2.6 + Math.random() * 1.5;
-        break;
-      default:
-        this.miniNextBehavior = n + 3.0 + Math.random() * 2.0;
+    const spec = this.permanentEmote ? EMOTE_SPECS[this.permanentEmote] : null;
+
+    // A looping emote owns the mini's behaviour entirely; a non-looping one
+    // falls through to the idle life below.
+    if (spec?.mini) {
+      const next = spec.mini(this, n);
+      if (typeof next === "number") {
+        this.miniNextBehavior = next;
+        return;
+      }
+    }
+
+    // An idle pill used to just re-arm and do nothing, so every non-emote mini
+    // sat frozen. Give it a small idle life of its own: a brief bob, and every so
+    // often a squash-stretch. Both are far under the main character's
+    // amplitudes — these are 13 px dots.
+    if (this.isAnimating("oy") || this.isAnimating("sy")) {
+      this.miniNextBehavior = n + 0.4;
+      return;
+    }
+    if (Math.random() < 0.45) {
+      // Squash and stretch.
+      this.anim("sy", [[0.86, 90, Ease.out], [1.1, 130, Ease.out], [1, 180, Ease.back]]);
+      this.anim("sx", [[1.1, 90, Ease.out], [0.93, 130, Ease.out], [1, 180, Ease.back]]);
+      this.miniNextBehavior = n + 2.4 + Math.random() * 2.2;
+    } else {
+      // A small bob.
+      this.anim("oy", [[-0.06, 130, Ease.out], [0, 220, Ease.inOut]]);
+      this.miniNextBehavior = n + 2.0 + Math.random() * 2.6;
     }
   }
 

@@ -18,6 +18,15 @@ export const setClock = (ms: number) => (clock += ms - clock);
 /** The current fake time — what `performance.now()` reports. */
 export const clockNow = () => clock;
 
+/**
+ * Advances the fake clock by `ms` without running a frame.
+ *
+ * Needed because a wall-clock deadline (sleep after 10 min, absence after 3)
+ * cannot be reached by pumping 60 Hz frames 40 000 times. The frame loop reads
+ * `performance.now()`, so moving this clock is what makes those deadlines elapse.
+ */
+export const tickClock = (ms: number) => (clock += ms);
+
 // ── Canvas ───────────────────────────────────────────────────────────────────
 
 /** Every 2D method the island calls. Path-building ones record nothing. */
@@ -160,8 +169,15 @@ class FakeElement {
   get clientHeight() { return 320; }
   get offsetWidth() { return 720; }
   get offsetHeight() { return 320; }
+  private __scrollTop = 0;
+  private __scrollLeft = 0;
   get scrollHeight() { return 320; }
-  get scrollTop() { return 0; }
+  // Writable: the chat view assigns `scrollTop` to follow the newest message,
+  // and a getter-only stub throws where a real element would not.
+  get scrollTop() { return this.__scrollTop; }
+  set scrollTop(v: number) { this.__scrollTop = v; }
+  get scrollLeft() { return this.__scrollLeft; }
+  set scrollLeft(v: number) { this.__scrollLeft = v; }
   get scrollWidth() { return 720; }
 
   append(...nodes: any[]) {
@@ -271,8 +287,14 @@ export interface Harness {
   /** When false, rAF callbacks only run when `stepRaf` is called. */
   flushRaf: boolean;
   /** Runs one pending rAF callback. Returns whether one ran. */
-  stepRaf(): boolean;
-}
+  stepRaf(): boolean;  /**
+   * Drops every pending rAF callback and zeroes the frame counter.
+   *
+   * The pending queue is global, so an island from an earlier test keeps its own
+   * callback sitting in it. Pumping frames then advances loops that are not
+   * under test and every frame count is wrong. Call this between islands.
+   */
+  resetRaf(): void;}
 
 export function installDom(): Harness {
   const doc = new FakeDocument();
@@ -323,6 +345,11 @@ export function installDom(): Harness {
     return true;
   };
 
+  h.resetRaf = () => {
+    pending.clear();
+    h.framesRequested = 0;
+  };
+
   // `window` doubles as an event target: the island registers keydown/mousemove
   // on it (wireInput, followPageCursor), so it needs the listener API too.
   g.window = {
@@ -346,9 +373,14 @@ export function installDom(): Harness {
     winEvents.set(t, s);
   };
   g.window.removeEventListener = (t: string, fn: Function) => winEvents.get(t)?.delete(fn);
+  h.resetWindowEvents = () => {
+    winEvents.clear();
+  };
   /** Fires a window-level event, e.g. "mousemove". */
   g.window.fire = (t: string, event: any = {}) => {
-    for (const fn of [...(winEvents.get(t) ?? [])]) fn({ type: t, ...event });
+    // Real DOM events carry these; island code calls preventDefault on keys.
+    const ev = { type: t, preventDefault() {}, stopPropagation() {}, ...event };
+    for (const fn of [...(winEvents.get(t) ?? [])]) fn(ev);
   };
 
   g.setTimeout = g.window.setTimeout;

@@ -162,6 +162,9 @@ class AppState {
 
   stateOverride: BotStateName | null = null;
 
+  /** True while the island has been showing an idle Mochi for 10 minutes. */
+  asleep = false;
+
   /** Cursor in logical screen pixels, origin top-left (like AppState.mousePosition). */
   mouse = { x: 0, y: 0 };
   /** Cursor relative to the island's top-left corner. */
@@ -204,7 +207,13 @@ class AppState {
   }
 
   get effectiveState(): BotStateName {
-    return this.stateOverride ?? this.focusTask?.state ?? "idle";
+    if (this.stateOverride) return this.stateOverride;
+    // `sleeping` belongs to the island, not to any task: it means nobody has
+    // been around for a long time. It has to come through here, because
+    // `syncDom` re-asserts `setState(State.effectiveState)` on every dirty frame
+    // and would otherwise pull the bot straight back out of pyjamas.
+    if (this.asleep) return "sleeping";
+    return this.focusTask?.state ?? "idle";
   }
 
   /** True while at least one agent is doing something. Drives auto-expand:

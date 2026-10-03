@@ -278,6 +278,56 @@ body {
   animation-play-state: paused;
 }
 
+/* ── Emote picker ──────────────────────────────────────────────────────── */
+
+/* A row of chips under the bot, so every emote in EMOTE_SPECS is reachable
+   without wiring a trigger for it. Fixed, not absolute to the island: it is
+   appended to the root so it can sit outside the clipping island rect. */
+#emote-picker {
+  position: fixed;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(12, 13, 16, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  backdrop-filter: blur(8px);
+  z-index: 20;
+  animation: picker-in 0.18s cubic-bezier(0.3, 1.2, 0.4, 1);
+}
+
+.emote-chip {
+  border: 0;
+  border-radius: 999px;
+  padding: 4px 9px;
+  font: 500 10px var(--font);
+  color: var(--dim-2);
+  background: rgba(255, 255, 255, 0.06);
+  cursor: default;
+  transition: transform 0.12s ease-out, background 0.12s, color 0.12s;
+}
+
+.emote-chip:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--ink);
+}
+
+.emote-chip:active {
+  transform: scale(0.94);
+}
+
+@keyframes picker-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+}
+
 /* ── Cards ──────────────────────────────────────────────────────────────── */
 
 .card {

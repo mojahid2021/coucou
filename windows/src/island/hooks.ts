@@ -228,11 +228,17 @@ function handleHook(island: Island, payload: HookPayload) {
   };
 
   switch (name) {
-    case "SessionStart":
+    case "SessionStart": {
+      // A pill that has never been seen before: Mochi notices it. Only when the
+      // island is already up — revealing it *because* of the new pill is the
+      // reveal's job, and the character is not on screen to react yet.
+      const isNewPill = !State.tasks.some((t) => t.id === agentId);
       ensurePill();
       surface("overview", false);
       Sound.play("work");
+      if (isNewPill && State.mode === "expanded") island.react("curious");
       break;
+    }
 
     case "UserPromptSubmit": {
       ensurePill();
@@ -275,10 +281,14 @@ function handleHook(island: Island, payload: HookPayload) {
       break;
     }
 
-    case "Stop":
+    case "Stop": {
+      const stepsBefore = State.tasks.find((t) => t.id === agentId)?.steps.length ?? 0;
       State.updateTask(agentId, "finished");
       if (payload.message) State.appendStep(agentId, payload.message.slice(0, 60));
       Sound.play("finish");
+      // A turn that actually did something earns a celebration; a one-line edit
+      // does not. Counted before the Stop's own message was appended.
+      island.celebrateIfWorthIt(stepsBefore);
       if (focused) surface("finished", true);
       else State.setPillBadge(agentId, "finished");
       window.setTimeout(() => {
@@ -290,6 +300,7 @@ function handleHook(island: Island, payload: HookPayload) {
         }
       }, 5200);
       break;
+    }
 
     case "StopFailure":
       State.updateTask(agentId, "error");
