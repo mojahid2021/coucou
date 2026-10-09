@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The step counter stops lying after 20 steps, and the ticker stops dying: a long session used to freeze its counter at `20/20` and stop showing new steps entirely, because both read their numbers out of a 20-entry ring buffer that had filled up. The history is now kept whole, so the counter keeps counting (`47 steps`) and Mochi keeps scrolling every step for the whole session. The same session no longer throws a celebration party for a one-line fix — that check counts the steps in the current turn, not the whole session. On macOS, on Windows and on Linux.
+
+- The island no longer folds while you are reading it: leaving the mouse on the card pauses the auto-close countdown instead of restarting it, so reading a long chat or scrolling a result cannot make it disappear from under you. Moving the mouse off brings the countdown back with the full delay, the countdown line hides while the clock is paused, and 10 minutes of uninterrupted hover is still enough for it to fold — on macOS and on Windows/Linux.
+
+- Chat with any OpenAI-compatible server, on macOS and on Windows/Linux. Set a base URL, an optional API key and a model in Settings → Chat — custom endpoint: OpenRouter, Groq, Ollama, LM Studio, vLLM, Azure or OpenAI itself all work. A local server needs no key at all. The model list is fetched from your endpoint when you open the picker, and any model id can be typed in if your server has no `/models` route. **Whatever URL you set receives the whole conversation**, so point it at a server you trust — Coucou makes no request until you send a message.
 - GitHub Copilot support, on macOS and on Windows/Linux. Sessions show up live on their own Copilot pill next to Claude Code, and permission requests get Allow / Deny in the notch. Install from Settings → GitHub Copilot: one hook file covers the Copilot CLI, the VS Code extension and VS Code's own agent. Approvals ride Copilot's `permissionRequest` hook rather than `preToolUse`, because Copilot treats a crashing `preToolUse` hook as a deny — a Coucou bug can never block your tool calls. In VS Code, set the Session Target to **Copilot**.
 
 ## 0.1.2 — October 2, 2026

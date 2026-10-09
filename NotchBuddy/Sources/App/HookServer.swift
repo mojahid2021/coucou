@@ -688,8 +688,10 @@ final class HookServer: @unchecked Sendable {
     private func appendStep(id: String, step: String) {
         let state = AppState.shared
         guard let idx = state.tasks.firstIndex(where: { $0.id == id }) else { return }
+        // Uncapped: `steps.count` is the real step count and `stepIndex` a real
+        // position. The 20-entry cap this replaced silently pinned both, which
+        // froze the counter at `20/20` and stopped the ticker dead.
         state.tasks[idx].steps.append(step)
-        if state.tasks[idx].steps.count > 20 { state.tasks[idx].steps.removeFirst() }
         state.tasks[idx].stepIndex = state.tasks[idx].steps.count - 1
     }
 

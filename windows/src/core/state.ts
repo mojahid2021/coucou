@@ -11,7 +11,10 @@ export interface AgentTask {
   name: string;
   color: string;
   state: BotStateName;
+  /** Index of the newest step in `steps`. Always `steps.length - 1`. */
   stepIndex: number;
+  /** Every step this session has produced, oldest first. Uncapped: the history
+   *  is what the counter and the ticker read, so truncating it froze both. */
   steps: string[];
   source: AgentSource;
   isIntegration: boolean;
@@ -56,7 +59,8 @@ export interface SearchResult {
 const task = (
   id: string, name: string, color: string, source: AgentSource,
 ): AgentTask => ({
-  id, name, color, state: "idle", stepIndex: 0, steps: [], source, isIntegration: true,
+  id, name, color, state: "idle", stepIndex: 0, steps: [],
+  source, isIntegration: true,
 });
 
 /** AgentTask.integrationAgents — same ids, names and colours as macOS. */
@@ -106,6 +110,55 @@ export interface Settings {
   copilotHooksInstalled?: boolean;
   /** Claude model used by the chat. */
   model: string;
+  /** Which provider answers the chat. Anything unknown falls back to "anthropic". */
+  chatProvider?: ChatProviderId;
+  /** Base URL of the user's OpenAI-compatible endpoint. Not a secret. */
+  customBaseUrl?: string;
+  /** Model id sent to that endpoint. */
+  customModel?: string;
+}
+
+/** The providers the chat knows about. Mirrors PROVIDER_* in settings.rs. */
+export type ChatProviderId = "anthropic" | "custom";
+
+export const ANTHROPIC_ACCENT = "#E07950";
+export const CUSTOM_ACCENT = "#6E7BE8";
+
+export const CHAT_PROVIDER_ACCENT: Record<ChatProviderId, string> = {
+  anthropic: ANTHROPIC_ACCENT,
+  custom: CUSTOM_ACCENT,
+};
+
+export const CHAT_PROVIDER_LABEL: Record<ChatProviderId, string> = {
+  anthropic: "Anthropic",
+  custom: "Custom",
+};
+
+/** Never throws on a hand-edited settings.json — an unknown value means Anthropic. */
+export function normalizeChatProvider(value: unknown): ChatProviderId {
+  return value === "custom" ? "custom" : "anthropic";
+}
+
+/** The model the active provider will actually be asked for. */
+export function activeChatModel(settings: Settings): string {
+  return normalizeChatProvider(settings.chatProvider) === "custom"
+    ? settings.customModel ?? ""
+    : settings.model;
+}
+
+/** 1_000_000 → "1M", 524_288 → "524k", 200_000 → "200k".
+ *
+ *  Deliberately coarse: a popover row is 300px wide, and "1,000,000 tokens" would
+ *  push the model id out of view. Matches the Rust side's formatter.
+ */
+export function formatTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return `${Math.round(m * 10) / 10}M`;
+  }
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return String(n);
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -121,6 +174,9 @@ export const DEFAULT_SETTINGS: Settings = {
   hooksInstalled: false,
   copilotHooksInstalled: false,
   model: "claude-opus-5",
+  chatProvider: "anthropic",
+  customBaseUrl: "",
+  customModel: "",
 };
 
 /** Auto-close delays offered in the island settings card, in seconds.
@@ -152,6 +208,25 @@ export function isBusyState(s: BotStateName): boolean {
 }
 
 type Listener = () => void;
+
+/**
+ * Labels for the steps after index `fromExclusive`, oldest first, capped at `max`.
+ *
+ * `fromExclusive` is an **index** into `steps` — the one already shown — so the
+ * new ones start at `fromExclusive + 1`. The only place a step range is walked,
+ * shared by the counter and the ticker so they can never disagree about which
+ * steps exist. `steps` is uncapped, so an index into it is a real position — no
+ * ring arithmetic, nothing to misalign.
+ *
+ * When there are more than `max` new steps the **newest** ones win: a burst has
+ * to end on the step that just happened, or the ticker lands on stale work.
+ */
+export function stepsSince(task: AgentTask, fromExclusive: number, max: number): string[] {
+  const first = Math.max(0, fromExclusive + 1);
+  if (first >= task.steps.length) return [];
+  const start = Math.max(first, task.steps.length - max);
+  return task.steps.slice(start);
+}
 
 class AppState {
   mode: IslandMode = "hidden";
@@ -242,12 +317,26 @@ class AppState {
     this.notify();
   }
 
+  /**
+   * Appends a step. The history grows with the session — there is no cap, so
+   * `steps.length` is the real step count and `stepIndex` a real position. The
+   * cap this replaced silently pinned both, which is what froze the counter at
+   * `20/20` and stopped the ticker dead.
+   */
   appendStep(id: string, step: string) {
     const t = this.tasks.find((x) => x.id === id);
     if (!t) return;
     t.steps.push(step);
-    if (t.steps.length > 20) t.steps.shift();
     t.stepIndex = t.steps.length - 1;
+    this.notify();
+  }
+
+  /** Empties the history for a new session. */
+  clearSteps(id: string) {
+    const t = this.tasks.find((x) => x.id === id);
+    if (!t) return;
+    t.steps = [];
+    t.stepIndex = 0;
     this.notify();
   }
 

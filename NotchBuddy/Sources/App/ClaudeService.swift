@@ -64,6 +64,8 @@ final class KeychainStore: @unchecked Sendable {
         "anthropic-api-key",
         "google-api-key",
         "openai-api-key",
+        // Optional — a local Ollama or LM Studio needs no auth.
+        "custom-api-key",
         "resend-api-key", "resend-from",
         "n8n-url", "n8n-api-key",
         "vercel-token",
@@ -115,7 +117,7 @@ final class ClaudeService {
 
     /// Fetches available models from the Anthropic API in the order the API returns them
     /// (newest first). Returns an empty array on any error — callers fall back to a static list.
-    static func fetchModels(apiKey: String) async -> [(id: String, label: String)] {
+    static func fetchModels(apiKey: String) async -> [(id: String, label: String, detail: ChatModelDetail?)] {
         guard let url = URL(string: "https://api.anthropic.com/v1/models?limit=100") else { return [] }
         var req = URLRequest(url: url, timeoutInterval: 10)
         req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
@@ -127,13 +129,13 @@ final class ClaudeService {
         return items.compactMap { item in
             guard let id = item["id"] as? String,
                   let name = item["display_name"] as? String else { return nil }
-            return (id: id, label: name)
+            return (id: id, label: name, detail: nil)
         }
     }
 
     /// Fetches Gemini models via the OpenAI-compatible endpoint.
     /// Strips the "models/" prefix that the API sometimes returns and filters non-chat models.
-    static func fetchGoogleModels(apiKey: String) async -> [(id: String, label: String)] {
+    static func fetchGoogleModels(apiKey: String) async -> [(id: String, label: String, detail: ChatModelDetail?)] {
         guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/models") else { return [] }
         var req = URLRequest(url: url, timeoutInterval: 10)
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -147,13 +149,13 @@ final class ClaudeService {
             let id = raw.hasPrefix("models/") ? String(raw.dropFirst(7)) : raw
             let lower = id.lowercased()
             guard !excluded.contains(where: { lower.contains($0) }) else { return nil }
-            return (id: id, label: id)
+            return (id: id, label: id, detail: nil)
         }
     }
 
     /// Fetches chat models from the OpenAI API, sorted newest-first by creation date.
     /// Excludes non-chat model families.
-    static func fetchOpenAIModels(apiKey: String) async -> [(id: String, label: String)] {
+    static func fetchOpenAIModels(apiKey: String) async -> [(id: String, label: String, detail: ChatModelDetail?)] {
         guard let url = URL(string: "https://api.openai.com/v1/models") else { return [] }
         var req = URLRequest(url: url, timeoutInterval: 10)
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -172,7 +174,175 @@ final class ClaudeService {
                 return (id: id, created: item["created"] as? Int ?? 0)
             }
             .sorted { $0.created > $1.created }
-            .map { (id: $0.id, label: $0.id) }
+            .map { (id: $0.id, label: $0.id, detail: nil) }
+    }
+
+    /// Validates a user-typed base URL and reduces it to `scheme://host[:port]/prefix`.
+    ///
+    /// `nonisolated` and synchronous on purpose: `ChatProvider.normalizedBaseURL`
+    /// calls it from a non-isolated enum, and under `-strict-concurrency=complete`
+    /// a plain static on a `@MainActor` type would not be reachable from there.
+    /// It touches only its argument — no shared state — so this is sound.
+    ///
+    /// Mirrors `normalize_base_url` in `openai_compat.rs` — both platforms must
+    /// accept exactly the same inputs, or the same settings string works on one
+    /// and fails on the other. The table is asserted on both sides
+    /// (`base_url_agrees_with_the_swift_normaliser_case_for_case` in Rust,
+    /// `tests/ChatBaseURLTests.swift` in Swift).
+    nonisolated static func normalizedChatBaseURL(_ raw: String) -> String? {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // Checked before parsing: `URL(string:)` is lenient about the case that
+        // matters, so `https:///v1` would otherwise resolve to the host `v1`.
+        guard let range = trimmed.range(of: "://") else { return nil }
+        let authority = String(trimmed[range.upperBound...])
+        guard !authority.isEmpty, !authority.hasPrefix("/") else { return nil }
+
+        for suffix in ["/chat/completions", "/completions", "/models", "/v1/chat/completions"] {
+            if trimmed.hasSuffix(suffix) {
+                trimmed = String(trimmed.dropLast(suffix.count))
+                break
+            }
+        }
+        while trimmed.hasSuffix("/") { trimmed.removeLast() }
+
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty,
+              // A URL carrying its own credentials or a query string would do
+              // something other than what the user typed. The key belongs in the
+              // Keychain, not in the address bar.
+              url.user == nil, url.password == nil,
+              url.query == nil, url.fragment == nil
+        else { return nil }
+        return trimmed
+    }
+
+    /// What an endpoint says a model can do, plus its limits.
+///
+/// Purely descriptive: nothing here changes what Coucou sends. Every field is
+/// optional, and the whole detail is `nil` for a classic OpenAI response — the
+/// three hosted providers report none of this.
+struct ChatModelDetail {
+    var contextLength: Int?
+    var maxOutputTokens: Int?
+    var inputModalities: [String] = []
+    var toolCalling = false
+    var reasoning = false
+    var thinking = false
+    var vision = false
+
+    var isEmpty: Bool {
+        contextLength == nil && maxOutputTokens == nil && inputModalities.isEmpty
+            && !toolCalling && !reasoning && !thinking && !vision
+    }
+
+    /// The second line under the model id, or "" when there is nothing to say.
+    /// Mirrors `modelDetail` in windows/src/views/chat.ts.
+    var summary: String {
+        var parts: [String] = []
+        let context = ChatModelDetail.tokenCount(contextLength)
+        if let context { parts.append("\(context) ctx") }
+        // Hidden when it merely rounds to the same figure as the context: every
+        // entry of a router family reports the same pair, and repeating it on
+        // every row is noise.
+        let out = ChatModelDetail.tokenCount(maxOutputTokens)
+        if let out, out != context { parts.append("\(out) out") }
+        if !inputModalities.isEmpty { parts.append("in: \(inputModalities.joined(separator: " "))") }
+        if vision { parts.append("vision") }
+        if toolCalling { parts.append("tools") }
+        if reasoning || thinking { parts.append("reasoning") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// 1_000_000 → "1M", 524_288 → "524k". Coarse on purpose: the picker row is
+    /// 300pt wide and "1,000,000 tokens" would push the id out of view.
+    static func tokenCount(_ value: Int?) -> String? {
+        guard let value, value > 0 else { return nil }
+        if value >= 1_000_000 {
+            let millions = Double(value) / 1_000_000
+            return "\((millions * 10).rounded() / 10)M"
+        }
+        if value >= 1_000 { return "\((Double(value) / 1_000).rounded())k" }
+        return String(value)
+    }
+}
+
+    /// Fetches the models a user-supplied endpoint advertises.
+    ///
+    /// `nonisolated` because it only performs a network request and builds a
+    /// value — it reads no `@MainActor` state, so there is nothing to serialise
+    /// it against.
+    ///
+    /// No filtering by name: an endpoint Coucou knows nothing about may call its
+    /// models anything, and a wrongly-filtered model is one the user cannot reach
+    /// at all. Non-chat ids are harmless here — they simply fail if picked.
+    nonisolated static func fetchCustomModels(baseURL: String, apiKey: String?) async -> [(id: String, label: String, detail: ChatModelDetail?)] {
+        guard let base = normalizedChatBaseURL(baseURL),
+              let url = URL(string: base + "/models") else { return [] }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        if let key = apiKey, !key.isEmpty {
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return [] }
+        // `{"data":[…]}` is the documented shape; a bare array turns up on
+        // self-hosted servers often enough to be worth accepting.
+        var list: [[String: Any]] = []
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let items = json["data"] as? [[String: Any]] {
+                list = items
+            }
+        } else if let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            list = json
+        } else {
+            return []
+        }
+        var seen = Set<String>()
+        var models: [(id: String, label: String, detail: ChatModelDetail?)] = []
+        for item in list {
+            guard let raw = item["id"] as? String else { continue }
+            let id = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, seen.insert(id).inserted else { continue }
+            models.append((id: id, label: id, detail: parseModelDetail(item)))
+        }
+        return models
+    }
+
+    /// The optional metadata block of one `/models` entry.
+    ///
+    /// Every field is read defensively: absent, null, or of an unexpected type all
+    /// yield nil, and a malformed entry keeps its model rather than losing it.
+    private nonisolated static func parseModelDetail(_ item: [String: Any]) -> ChatModelDetail? {
+        // Zero is treated as absent — servers send it for "unknown", and showing
+        // "0 ctx" is worse than showing nothing.
+        func positive(_ key: String) -> Int? {
+            guard let n = item[key] as? Int, n > 0 else { return nil }
+            return n
+        }
+        var detail = ChatModelDetail(
+            contextLength: positive("context_length"),
+            maxOutputTokens: positive("max_output_tokens"),
+            inputModalities: (item["input_modalities"] as? [String] ?? [])
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+        if let caps = item["capabilities"] as? [String: Any] {
+            // A string "true" is accepted because some self-hosted servers send
+            // it; anything unrecognised stays false rather than claiming support.
+            func flag(_ key: String) -> Bool {
+                if let b = caps[key] as? Bool { return b }
+                if let s = caps[key] as? String { return s.lowercased() == "true" }
+                return false
+            }
+            detail.toolCalling = flag("tool_calling")
+            detail.reasoning = flag("reasoning")
+            detail.thinking = flag("thinking")
+            detail.vision = flag("vision")
+        }
+        return detail.isEmpty ? nil : detail
     }
 
     /// Chosen in Settings; falls back to the default when the field is left empty.
@@ -251,12 +421,16 @@ final class ClaudeService {
         }
     }
 
-    // MARK: - OpenAI-compatible chat (Google Gemini / OpenAI)
+    // MARK: - OpenAI-compatible chat (Google Gemini / OpenAI / custom endpoint)
 
     func chatOpenAICompatible(query: String, context: PromptContext?, state: AppState) async {
         let provider = state.chatProvider
         guard provider != .anthropic else { return }
-        guard let key = KeychainStore.shared.get(provider.keychainKey), !key.isEmpty else {
+
+        // A custom endpoint may legitimately have no key at all, so the key is
+        // only required when the provider has one to give.
+        let key = KeychainStore.shared.get(provider.keychainKey)
+        if !provider.keyIsOptional, key?.isEmpty ?? true {
             await showError("\(provider.displayName) API key missing. Configure it in Settings.", state: state)
             return
         }
@@ -265,6 +439,12 @@ final class ClaudeService {
         switch provider {
         case .google:  baseURL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         case .openai:  baseURL = "https://api.openai.com/v1/chat/completions"
+        case .custom:
+            guard let base = Self.normalizedChatBaseURL(state.customChatBaseUrl) else {
+                await showError("Base URL missing or invalid. Add it in Settings → Chat — other providers.", state: state)
+                return
+            }
+            baseURL = base + "/chat/completions"
         case .anthropic: return
         }
         guard let url = URL(string: baseURL) else { return }
@@ -289,8 +469,18 @@ final class ClaudeService {
                 var prefix = "Context — App: \(app), Window: \(title)"
                 if let u = url { prefix += ", URL: \(u)" }
                 userText = prefix + "\n\n" + query
-            case .file(let name, _):
-                userText = "File: \(name)\n\n" + query
+            case .file(let name, let fileURL):
+                // The hosted providers get only the filename, as they always have.
+                // A custom endpoint is far more likely to be a local model that
+                // can actually read the file, and it is the only provider the
+                // user vouched for themselves — so the contents are inlined,
+                // matching openai_compat.rs and therefore matching Windows/Linux.
+                if provider == .custom, let fileURL = fileURL,
+                   let contents = readFileAsText(url: fileURL) {
+                    userText = "File contents:\n\(contents)\n\nFile: \(name)\n\n\(query)"
+                } else {
+                    userText = "File: \(name)\n\n" + query
+                }
             }
         }
         msgs.append(["role": "user", "content": userText])
@@ -305,7 +495,9 @@ final class ClaudeService {
         var req = URLRequest(url: url, timeoutInterval: 30)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        if let key, !key.isEmpty {
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {
@@ -508,6 +700,16 @@ final class ClaudeService {
 
     // MARK: - File content block builder
 
+    /// Reads a text/code file whole, or returns nil.
+    ///
+    /// Shared with the custom endpoint path, which has no document/image block to
+    /// put a PDF in and so only ever sends the text side. Mirrors `file_as_text`
+    /// in openai_compat.rs — 200 KB, UTF-8 only.
+    private func readFileAsText(url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url), data.count <= 200_000 else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     private func readFileAsBlock(url: URL) -> [String: Any]? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let ext = url.pathExtension.lowercased()
@@ -525,8 +727,7 @@ final class ClaudeService {
             return ["type": "image", "source": ["type": "base64", "media_type": "image/webp", "data": base64]]
         } else {
             // Text/code — inline as text if <= 200 KB
-            guard data.count <= 200_000,
-                  let text = String(data: data, encoding: .utf8) else { return nil }
+            guard let text = readFileAsText(url: url) else { return nil }
             return ["type": "text", "text": "File contents:\n\(text)"]
         }
     }

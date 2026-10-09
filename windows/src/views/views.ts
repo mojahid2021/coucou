@@ -202,10 +202,13 @@ function buildOverview(actions: ViewActions): ViewHost {
           h("span", { class: "name", text: task.name }),
           h("span", { class: "tool", text: sessionSubtitle(task) }),
         );
+        // The session's step count. The old `stepIndex+1 / steps.length` froze at 20/20
+        // once the history hit its 20-entry cap, which read as a progress bar stuck
+        // at 100 %. A single-step session shows nothing.
         if (task.steps.length > 1) {
           who.append(h("span", {
             class: "count",
-            text: `${Math.min(task.stepIndex + 1, task.steps.length)}/${task.steps.length}`,
+            text: `${task.steps.length} steps`,
           }));
         }
         ticker.sync(task);

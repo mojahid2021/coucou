@@ -87,6 +87,7 @@ final class VercelPoller: @unchecked Sendable {
 
         appState.tasks[idx].state = latest.isSuccess ? .finished : .error
         appState.tasks[idx].steps = [latest.projectName]
+        appState.tasks[idx].stepIndex = appState.tasks[idx].steps.count - 1
 
         if !focused {
             appState.tasks[idx].pillBadge = latest.isSuccess ? .finished : .error
@@ -102,6 +103,7 @@ final class VercelPoller: @unchecked Sendable {
             guard appState.tasks[i].state == .finished || appState.tasks[i].state == .error else { return }
             appState.tasks[i].state = .idle
             appState.tasks[i].steps = []
+            appState.tasks[i].stepIndex = 0
             appState.tasks[i].pillBadge = nil
         }
     }

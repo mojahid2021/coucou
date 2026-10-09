@@ -37,9 +37,10 @@ Grille compact : pastilles Ø 9,5 autour du point (largeur − 27, hN/2), écart
 2. **Souris sur le notch** alors que `hidden` → `peek` immédiatement, le bonhomme sort en faisant coucou (mains + son `peek` + son `greet`). Si la souris reste 650 ms → `expanded` (vue `overview`, ou `empty` s'il n'y a aucune tâche). Si elle part pendant le peek → retour `hidden` après 600 ms. **Si un agent travaille déjà, le survol ouvre `expanded` directement, sans peek.**
 3. **Des tâches tournent et Louis est actif** → `compact` : très fin, le bonhomme visible, il suit la souris des yeux partout sur l'écran. Un événement de travail (démarrage de session, prompt, outil) ouvre `expanded` et l'y garde.
 4. **Survol en compact** → `expanded` après 200 ms. Clic sur le bonhomme en compact → `expanded` tout de suite.
-5. **Fermeture auto** : le délai est réglable (pastilles `3 / 5 / 10 / 15 / 30` s dans la carte de réglages, ou champ libre borné à 3–300 s dans les Réglages ; 15 s par défaut). L'island se replie **quand il n'y a plus rien qui tourne**, après ce délai d'inactivité (mouvement de souris sur l'island, clic, frappe). Tant qu'un agent est en `working` / `thinking` / `searching` / `approval` / `question` / `error` / `ratelimit`, l'island reste `expanded` et aucun compte à rebours ne tourne. Quitter l'island ne remet pas le compteur à zéro de lui-même, mais l'ignorer ne l'empêche pas de se replier. Pendant les 10 dernières secondes, un trait de 2 pt en bas au centre (160 pt → 0, blanc 35 %) montre le compte à rebours. `Échap` ferme.
-   - **Plafond** : le travail en cours ne peut pas maintenir l'island ouverte plus de 10 min sans condition. Un `Stop` qui n'arrive jamais (agent crashé, terminal tué) ne doit pas laisser la carte ouverte indéfiniment.
+5. **Fermeture auto** : le délai est réglable (pastilles `3 / 5 / 10 / 15 / 30` s dans la carte de réglages, ou champ libre borné à 3–300 s dans les Réglages ; 15 s par défaut). L'island se replie **quand il n'y a plus rien qui tourne**, après ce délai d'inactivité (mouvement de souris sur l'island, clic, frappe). Tant qu'un agent est en `working` / `thinking` / `searching` / `approval` / `question` / `error` / `ratelimit`, l'island reste `expanded` et aucun compte à rebours ne tourne. **La souris posée sur l'island suspend le compte à rebours** (il ne repart pas de zéro, il s'arrête) : quitter l'island relance le délai complet. Le trait de compte à rebours disparaît pendant ce temps, puisqu'il afficherait un drainage qui n'a pas lieu. Pendant les 10 dernières secondes, un trait de 2 pt en bas au centre (160 pt → 0, blanc 35 %) montre le compte à rebours. `Échap` ferme.
+   - **Plafond** : ni le travail en cours ni le survol ne peuvent maintenir l'island ouverte plus de 10 min sans condition. Un `Stop` qui n'arrive jamais (agent crashé, terminal tué) ne doit pas laisser la carte ouverte indéfiniment, et un signal de souris perdu ne doit pas la figer non plus.
    - `idle`, `finished`, `sleeping` et `dizzy` ne comptent pas comme du travail : une tâche qui passe à `idle` relance le compte à rebours.
+   - Même règle en `compact` : la souris posée sur la barre suspend son auto-hide de 60 s.
 6. **Louis absent** (aucun mouvement de souris depuis 3 min, réglable) → `hidden`, même avec des tâches. Au premier mouvement → retour `compact` si des tâches tournent.
 7. **Alertes** (permission, question, erreur) : l'island s'ouvre seule sur la vue de l'alerte, **même si Louis est absent**, et reste ouverte (pas de fermeture auto) jusqu'à sa réponse.
 8. **Terminé** : l'island s'ouvre sur la vue `finished` pendant 5,2 s, puis retire la tâche et se replie.
@@ -100,7 +101,7 @@ Toutes les pastilles déclarées sont définies dans `PillCatalog.all` (source d
 |---|---|---|---|---|
 | `workspace` | Where you code | VS Code, Cursor, Antigravity *(GitHub only)*, Codex *(GitHub only)* | Integration | Claude Code / Cursor / Codex / Agent |
 | `agent` | Agents | Gemini CLI *(GitHub only)* | Agent | Agent |
-| `ai` | AI for the chat | Anthropic, Google AI, OpenAI | Chat | — |
+| `ai` | AI for the chat | Anthropic, Google AI, OpenAI, Custom | Chat | — |
 | `service` | Services | Resend, n8n, Vercel, GitHub, Notion, Cal.com, Stripe, Apple Music *(GitHub only)* | Integration | — |
 
 Couleurs : Cursor `#C0C4CC`, Codex `#2DD4BF`, Gemini CLI `#8AB4F8`, Antigravity `#E879F9`, pastilles IA = `ChatProvider.accentHex`.
@@ -113,7 +114,7 @@ Règles :
 - `sortTasksByCatalog` : pastilles du catalogue dans l'ordre du catalogue ; pastilles hors catalogue juste après `integration_claude`.
 - Pastilles `githubOnly` : exclues des builds App Store (`#if APPSTORE`).
 - Hooks (Gemini CLI, Antigravity, Codex) : `isConfigured` = `HookServer.geminiHooksInstalled()` / `agyHooksInstalled()` / `codexHooksInstalled()` sous `#if !APPSTORE`. La section Codex Hooks dans Settings installe les hooks dans `~/.codex/hooks.json` avec le même flux backup + preview que Gemini CLI. Après l'installation, la carte affiche : « run /hooks in Codex or open Hooks in the app's settings to trust them ». Approbations Codex : carte avec Allow et Deny seulement (pas Always) ; updatedPermissions jamais envoyé ; notes « Handled in Codex. » / « Still waiting in Codex. ».
-- Pastilles IA : `isConfigured` = clé API dans le Keychain. Bouton « Chat with… » → change le fournisseur et ouvre la vue `.prompt`.
+- Pastilles IA : `isConfigured` = clé API dans le Keychain — sauf `ai_custom`, qui est configurée par son URL de base validée (`ChatProvider.custom.normalizedBaseURL`), sa clé étant facultative. Bouton « Chat with… » → change le fournisseur et ouvre la vue `.prompt`.
 
 ### Boutons
 - Pilule, 12,5 pt medium, fond blanc 9 % (survol 15 %), primaire : fond `#F5F6F8` texte `#0B0C0E`. Appui : échelle 0,94. Raccourcis affichés en petite pastille bordée (Y, N).
@@ -211,7 +212,7 @@ Petit item dans la barre de menus (icône : silhouette du Mochi, monochrome). Me
 
 Fenêtre Réglages (SwiftUI, simple), sections dans l'ordre d'affichage :
 - **Anthropic API** : clé (Trousseau), modèle (défaut `claude-sonnet-4-6` ; liste depuis l'API, voir INTEGRATIONS §5).
-- **Chat — other providers** : clé Google AI (Trousseau) ; clé OpenAI (Trousseau). Les modèles se choisissent dans le chat (voir INTEGRATIONS §5bis).
+- **Chat — other providers** : clé Google AI (Trousseau) ; clé OpenAI (Trousseau). Les modèles se choisissent dans le chat (voir INTEGRATIONS §5bis). Bloc « Custom endpoint » : URL de base (non secret, `custom_base_url` / `customChatBaseUrl`), clé facultative (Trousseau `custom-api-key`), identifiant de modèle. Sur macOS comme sur Windows/Linux (voir INTEGRATIONS §5ter).
 - **Claude Code Hooks** : état des hooks, bouton Installer / Désinstaller.
 - **Gemini CLI Hooks** *(build GitHub)* : état des hooks, bouton Installer / Désinstaller.
 - **Antigravity Hooks** *(build GitHub)* : état des hooks, bouton Installer / Désinstaller.

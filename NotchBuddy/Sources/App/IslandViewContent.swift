@@ -71,8 +71,11 @@ struct OverviewView: View {
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                                 Spacer(minLength: 2)
+                                // The session's step count. The old
+                                // `stepIndex+1 / steps.count` froze at 20/20 once the history hit
+                                // its 20-entry cap, which read as a progress bar stuck at 100 %.
                                 if agent.steps.count > 1 {
-                                    Text("\(min(agent.stepIndex + 1, agent.steps.count))/\(agent.steps.count)")
+                                    Text("\(agent.steps.count) steps")
                                         .font(.system(size: 11))
                                         .foregroundColor(Color(hex: "#6B7079"))
                                         .fixedSize()
@@ -175,6 +178,8 @@ struct OverviewView: View {
             switchChatProvider(.google)
         case "ai_openai":
             switchChatProvider(.openai)
+        case "ai_custom":
+            switchChatProvider(.custom)
         case "integration_music":
             #if !APPSTORE
             MusicController.shared.openMusic()
@@ -810,7 +815,10 @@ struct PromptView: View {
                             Circle()
                                 .fill(Color(hex: state.chatProvider.accentHex))
                                 .frame(width: 6, height: 6)
-                            Text(state.activeChatModel)
+                            // An unconfigured custom endpoint has no model yet;
+                            // saying so is better than an empty capsule.
+                            Text(state.activeChatModel.isEmpty && state.chatProvider == .custom
+                                 ? "Choose a model" : state.activeChatModel)
                                 .font(.system(size: 10.5, weight: .medium))
                                 .foregroundColor(Color(hex: "#7B8089"))
                             Image(systemName: "chevron.up.chevron.down")
@@ -889,6 +897,7 @@ struct PromptView: View {
 struct ModelPickerView: View {
     @ObservedObject var state: AppState
     @Binding var isPresented: Bool
+    @State private var manualModelId: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -928,9 +937,14 @@ struct ModelPickerView: View {
 
             Divider().opacity(0.2)
 
-            // Model list for current provider — fetched dynamically
-            modelListView
-                .frame(height: 260, alignment: .top)
+            // Model list for current provider — fetched dynamically, with the manual
+            // entry field below it. The height covers both, so the "Use" button
+            // is never clipped out of the popover.
+            VStack(alignment: .leading, spacing: 0) {
+                modelListView
+                    .frame(maxHeight: 210, alignment: .top)
+                manualModelEntry
+            }
         }
         .padding(14)
         .background(Color(hex: "#16171B"))
@@ -965,25 +979,35 @@ struct ModelPickerView: View {
                             case .anthropic: state.claudeModel = model.id
                             case .google:    state.googleChatModel = model.id
                             case .openai:    state.openAIChatModel = model.id
+                            case .custom:    state.customChatModel = model.id
                             }
                             isPresented = false
                             SoundEngine.shared.play("blip")
                         } label: {
-                            HStack {
+                            VStack(alignment: .leading, spacing: 1) {
                                 Text(model.label)
                                     .font(.system(size: 12))
                                     .foregroundColor(state.activeChatModel == model.id
                                                      ? Color(hex: state.chatProvider.accentHex)
                                                      : Color(hex: "#C8CDD4"))
-                                Spacer()
-                                if state.activeChatModel == model.id {
-                                    Image(systemName: "checkmark")
-                                        .font(.system(size: 10, weight: .semibold))
-                                        .foregroundColor(Color(hex: state.chatProvider.accentHex))
+                                // Absent for the hosted providers, which report no
+                                // limits — their rows look exactly as they did.
+                                if let summary = model.detail?.summary, !summary.isEmpty {
+                                    Text(summary)
+                                        .font(.system(size: 10))
+                                        .foregroundColor(Color(hex: "#6B7079"))
+                                        .lineLimit(1)
                                 }
                             }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
+                            Spacer()
+                            if state.activeChatModel == model.id {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundColor(Color(hex: state.chatProvider.accentHex))
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
                             .background(state.activeChatModel == model.id
                                         ? Color(hex: state.chatProvider.accentHex).opacity(0.1)
                                         : Color.clear)
@@ -994,6 +1018,36 @@ struct ModelPickerView: View {
                 }
             }
         }
+
+    /// Always offered, whatever the fetch did. A server with no `/models`
+    /// route is ordinary — Ollama and LM Studio both do — so typing the id is
+    /// the only way through on those, and it is the sole escape hatch when the
+    /// fetch fails outright.
+    private var manualModelEntry: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Divider().opacity(0.2).padding(.vertical, 6)
+
+            HStack(spacing: 6) {
+                TextField("Model id", text: $manualModelId)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+                Button("Use") {
+                    let typed = manualModelId.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !typed.isEmpty else { return }
+                    switch state.chatProvider {
+                    case .anthropic: state.claudeModel = typed
+                    case .google:    state.googleChatModel = typed
+                    case .openai:    state.openAIChatModel = typed
+                    case .custom:    state.customChatModel = typed
+                    }
+                    isPresented = false
+                    SoundEngine.shared.play("blip")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(manualModelId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .onAppear { manualModelId = state.activeChatModel }
     }
 }
 
@@ -1200,6 +1254,7 @@ struct IntegrationCardView: View {
         case "ai_anthropic":  return KeychainStore.shared.get("anthropic-api-key") != nil
         case "ai_google":     return KeychainStore.shared.get("google-api-key")    != nil
         case "ai_openai":     return KeychainStore.shared.get("openai-api-key")    != nil
+        case "ai_custom":     return ChatProvider.custom.normalizedBaseURL(AppState.shared.customChatBaseUrl) != nil
         case "integration_resend":  return KeychainStore.shared.get("resend-api-key") != nil
         case "integration_n8n":     return KeychainStore.shared.get("n8n-api-key")    != nil
         case "integration_vercel":  return KeychainStore.shared.get("vercel-token")   != nil
@@ -1310,18 +1365,22 @@ struct IntegrationCardView: View {
                    : nil
         if let err = svcErr { return err }
         let isHooks = task.id == "agent_gemini" || task.id == "agent_antigravity" || task.id == "agent_copilot"
-        let isAI    = task.id == "ai_anthropic" || task.id == "ai_google" || task.id == "ai_openai"
+        let isAI    = task.id == "ai_anthropic" || task.id == "ai_google" || task.id == "ai_openai" || task.id == "ai_custom"
         if isConfigured {
             if isHooks { return "Hooks installed" }
             if isAI {
                 let model = task.id == "ai_anthropic" ? appState.claudeModel
                           : task.id == "ai_google"    ? appState.googleChatModel
-                          :                             appState.openAIChatModel
-                return "Key configured · \(model)"
+                          : task.id == "ai_openai"    ? appState.openAIChatModel
+                          :                             appState.customChatModel
+                // A custom endpoint needs no key, so the model is the useful
+                // thing to report — not "Key configured".
+                return task.id == "ai_custom" ? "Endpoint set · \(model)" : "Key configured · \(model)"
             }
             return "Connected · loading…"
         } else {
             if isHooks { return "Hooks not installed" }
+            if task.id == "ai_custom" { return "No base URL" }
             return "Key not configured"
         }
     }
@@ -1380,7 +1439,7 @@ struct IntegrationCardView: View {
                         .lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 2)
                     if task.steps.count > 1 {
-                        Text("\(min(task.stepIndex + 1, task.steps.count))/\(task.steps.count)")
+                        Text("\(task.steps.count) steps")
                             .font(.system(size: 11))
                             .foregroundColor(Color(hex: "#6B7079"))
                             .fixedSize()
@@ -1471,10 +1530,8 @@ struct IntegrationCardView: View {
                             .buttonStyle(.plain)
                         }
                         #endif
-                    } else if task.id == "ai_anthropic" || task.id == "ai_google" || task.id == "ai_openai" {
+                    } else if let provider = aiProvider(forTaskId: task.id) {
                         if isConfigured {
-                            let provider: ChatProvider = task.id == "ai_anthropic" ? .anthropic
-                                                       : task.id == "ai_google"    ? .google : .openai
                             Button("Chat with \(task.name)") {
                                 switchChatProvider(provider)
                             }
@@ -2425,6 +2482,12 @@ struct TickerView: View {
     @State private var rowCOffset: CGFloat = 44
     @State private var rowCOpacity: Double = 0
 
+    /// The newest step index it has been shown.
+    ///
+    /// This is compared against `steps.count`, which only works while the history
+    /// is uncapped — the 20-entry ring buffer it replaced pinned both at 20, so
+    /// `onChange(of: steps.count)` stopped firing and the ticker froze solid for
+    /// the rest of a long session.
     @State private var displayIndex: Int = -1
     @State private var isTransitioning = false
 
@@ -2470,7 +2533,7 @@ struct TickerView: View {
             let idx = task?.stepIndex ?? -1
             displayIndex = idx
             if idx >= 0, !steps.isEmpty {
-                rowA = idx > 0 ? steps[max(0, idx - 1)] : "…"
+                rowA = idx > 0 ? steps[idx - 1] : "…"
                 rowB = steps[min(idx, steps.count - 1)]
             }
         }
@@ -2479,11 +2542,21 @@ struct TickerView: View {
             let newIdx = task.stepIndex
             if displayIndex < 0 {
                 displayIndex = newIdx
-                rowA = newIdx > 0 ? steps[max(0, newIdx - 1)] : "…"
+                rowA = newIdx > 0 ? steps[min(newIdx - 1, steps.count - 1)] : "…"
                 rowB = steps[min(newIdx, steps.count - 1)]
                 return
             }
+            // The session restarted (steps were cleared): re-seed rather than
+            // scroll a history that no longer exists.
             guard newIdx != displayIndex else { return }
+            guard newIdx > displayIndex else {
+                displayIndex = newIdx
+                rowA = newIdx > 0 ? steps[min(newIdx - 1, steps.count - 1)] : "…"
+                rowB = steps[min(newIdx, steps.count - 1)]
+                rowCOffset = 44
+                rowCOpacity = 0
+                return
+            }
             tickerAnimate(to: newIdx)
         }
     }
@@ -3336,6 +3409,21 @@ struct StatusBadge: View {
 // MARK: - Color extension (lighten)
 
 // MARK: - Chat-provider switch (used by AI pill buttons and ↗ action)
+
+/// The chat provider an AI pill represents, or nil for any other pill.
+///
+/// A lookup rather than a chain of ternaries: adding a fifth provider to
+/// `ChatProvider` must not silently leave its pill without a « Chat with… »
+/// button, which is exactly what happened when this was spelled out inline.
+func aiProvider(forTaskId id: String) -> ChatProvider? {
+    switch id {
+    case "ai_anthropic": return .anthropic
+    case "ai_google":    return .google
+    case "ai_openai":    return .openai
+    case "ai_custom":    return .custom
+    default:             return nil
+    }
+}
 
 /// Mirrors ModelPickerView provider-chip tap: animates, fires surprised emote + "pop" sound,
 /// then opens the chat view. No-op if provider is already selected (just opens chat).

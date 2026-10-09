@@ -25,6 +25,11 @@ final class IslandStateMachine {
     /// must not fold under the user. Driven by `AppState.hasActiveWork`.
     var isBusy: (() -> Bool)?
 
+    /// True while the pointer is over the island. Hovering *pauses* the auto-close
+    /// clock rather than resetting it: a cursor resting on a card the user is
+    /// reading must not fold it, and leaving restarts the full delay.
+    var isPointerOver: (() -> Bool)?
+
     /// home → petit delay (seconds). Bound to `AppState.autoCloseInterval` by
     /// the window controller; the default is only a fallback for tests.
     var homeToPetitDelay: TimeInterval = 15
@@ -42,12 +47,19 @@ final class IslandStateMachine {
     /// never arrives (crashed agent, killed terminal) would otherwise keep the
     /// card expanded indefinitely, so the ceiling wins over `isBusy`.
     var busyMaxHold: TimeInterval = 600
+    /// Hard ceiling on one *continuous* hover. Pausing is better than pinning,
+    /// but a pause with no end is a pin: the 60 Hz poll can stop seeing the
+    /// cursor (a moved panel, a full-screen app taking over), so losing the
+    /// pointer must not be able to strand the card open forever.
+    var hoverMaxHold: TimeInterval = 600
 
     private var petitHideWork: DispatchWorkItem?
     private var homeCollapseWork: DispatchWorkItem?
     private var greetCollapseWork: DispatchWorkItem?
     private var dwellExpandWork: DispatchWorkItem?
     private var busySince: Date?
+    /// Stamped on the pointer-over edge, so the ceiling counts this hover only.
+    private var hoverSince: Date?
 
     // MARK: – Inputs
 
@@ -59,6 +71,7 @@ final class IslandStateMachine {
 
     /// Mouse entered the island notch area
     func mouseEntered() {
+        stampHoverEdge()
         switch state {
         case .hidden:
             if isHeldOpen?() == true {
@@ -80,8 +93,12 @@ final class IslandStateMachine {
             // island is held open by an alert, which is already expanded.
             if isHeldOpen?() != true { scheduleDwellExpand(after: compactExpandDelay) }
         case .home:
-            // Interaction resets the auto-close clock.
-            resetActivity()
+            // Hover pauses the auto-close clock instead of resetting it. Clearing
+            // the timer outright would arm nothing at all, so the ceiling could
+            // never fire and a lost pointer signal would pin the island forever —
+            // `scheduleHomeCollapse` picks the ceiling branch while the pointer is
+            // over, which is what makes this a pause rather than a pin.
+            scheduleHomeCollapse()
         case .coucou:
             // Mouse hovering during greeting — cancel short auto-collapse, extend to hover delay
             scheduleGreetCollapse(delay: greetHoverCollapseDelay)
@@ -91,14 +108,15 @@ final class IslandStateMachine {
     /// Mouse left the island notch area
     func mouseLeft() {
         dwellExpandWork?.cancel(); dwellExpandWork = nil
+        hoverSince = nil
         switch state {
         case .hidden:
             break
         case .petit:
             schedulePetitHide()
         case .home:
-            // Leaving does not close the island, but the auto-close clock keeps
-            // running: it was armed when `.home` was entered, not here.
+            // Leaving does not close the island, but the pause is over: the clock
+            // restarts from the full delay now that the pointer is gone.
             scheduleHomeCollapse()
         case .coucou:
             if isHeldOpen?() != true {
@@ -107,6 +125,16 @@ final class IslandStateMachine {
                 transition(to: .petit)
             }
         }
+    }
+
+    /// Marks the start of a continuous hover, once per pointer-over edge.
+    ///
+    /// `mouseEntered` is driven by the 60 Hz poll, so stamping unconditionally
+    /// would restart the ceiling every frame and the island could then be held
+    /// open indefinitely.
+    private func stampHoverEdge() {
+        guard isPointerOver?() == true else { return }
+        if hoverSince == nil { hoverSince = .now }
     }
 
     /// Any interaction with the open island: mouse move, click or keypress.
@@ -216,6 +244,11 @@ final class IslandStateMachine {
 
     private func schedulePetitHide() {
         petitHideWork?.cancel()
+        // A pointer resting on the compact bar pauses its auto-hide, exactly as it
+        // pauses the fold of the expanded card. In practice the dwell expand wins
+        // first, but a pin that never expires is not a pause, so the ceiling below
+        // still has to exist for this clock.
+        if isPointerOver?() == true, isHeldOpen?() != true { return }
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.state == .petit, !(self.isHeldOpen?() ?? false) else { return }
             self.transition(to: .hidden)
@@ -237,18 +270,30 @@ final class IslandStateMachine {
             let held = busySince.map { Date.now.timeIntervalSince($0) } ?? 0
             delay = max(0, busyMaxHold - held)
             guard delay > 0 else { return }
+        } else if isPointerOver?() == true {
+            // Hover pauses rather than resets: a cursor resting on a card the user
+            // is reading must not fold it. Only the ceiling still runs, so a hover
+            // pauses the fold without being able to pin the island open forever.
+            let held = hoverSince.map { Date.now.timeIntervalSince($0) } ?? 0
+            delay = max(0, hoverMaxHold - held)
+            guard delay > 0 else { return }
         } else {
             delay = homeToPetitDelay
         }
 
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.state == .home, self.isHeldOpen?() != true else { return }
-            // The busy hold expires on wall-clock, not on "the work item happened
+            // Both holds expire on wall-clock, not on "the work item happened
             // to be early": a callback that runs a moment early must re-arm for
             // the remainder instead of returning and leaving the island open.
             if self.isBusy?() == true {
                 let since = self.busySince ?? .now
                 let left = self.busyMaxHold - Date.now.timeIntervalSince(since)
+                if left > 0 { self.scheduleHomeCollapse(); return }
+            }
+            if self.isPointerOver?() == true {
+                let since = self.hoverSince ?? .now
+                let left = self.hoverMaxHold - Date.now.timeIntervalSince(since)
                 if left > 0 { self.scheduleHomeCollapse(); return }
             }
             self.transition(to: .petit)
@@ -279,6 +324,9 @@ final class IslandStateMachine {
         homeCollapseWork?.cancel(); homeCollapseWork = nil
         greetCollapseWork?.cancel(); greetCollapseWork = nil
         dwellExpandWork?.cancel();   dwellExpandWork = nil
+        // A cancelled clock is not a pause: the next hover is a fresh one, so the
+        // ceiling must not keep counting from a hover that is already over.
+        hoverSince = nil
     }
 
     private func transition(to new: State) {

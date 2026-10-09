@@ -141,6 +141,24 @@ Voir le catalogue de pastilles dans `docs/SPEC.md` (section « Catalogue de past
 
 ---
 
+## 5ter. Fournisseur « Custom » (endpoint compatible OpenAI)
+
+Fourth chat provider, on **both** macOS and Windows/Linux. The user sets the base URL, an optional key and a model id; Coucou speaks the OpenAI `chat/completions` shape to whatever is there — OpenAI itself, OpenRouter, Groq, Ollama, LM Studio, vLLM, Azure.
+
+- **Base URL** : a *setting* (`custom_base_url` in `settings.json`, `customChatBaseUrl` in UserDefaults), never a secret. The key goes to the Keychain / Credential Manager / Secret Service as `custom-api-key`, which `KeychainStore.allKeys` and `secrets::KNOWN_KEYS` both list.
+- **The key is genuinely optional.** A local Ollama answers with no auth at all, so an empty `custom-api-key` is a valid configuration, not an error. The `Authorization: Bearer` header is only sent when a key exists. This is the one provider for which `ChatProvider.keyIsOptional` is true.
+- **Validation** (`normalize_base_url` in `windows/src-tauri/src/openai_compat.rs`, `ClaudeService.normalizedChatBaseURL` on macOS — the two must agree case for case, enforced by `base_url_agrees_with_the_swift_normaliser_case_for_case` and `tests/ChatBaseURLTests.swift`): `http`/`https` only, host required, no embedded credentials, no query string or fragment. A pasted full endpoint (`…/v1/chat/completions`, `…/models`, `…/completions`) is reduced to its base so the request does not become `…/chat/completions/chat/completions`. The `https:///v1` case is caught *before* URL parsing, because `URL(string:)` and `reqwest::Url` are both lenient about slashes and would otherwise resolve it to the host `v1`.
+- **Models** : `GET {base}/models`, `Authorization: Bearer` only when a key exists. No name-based filtering — an endpoint Coucou knows nothing about may call its models anything, and a wrongly-filtered model would be unreachable. Servers reporting no `created` timestamp keep their own order. `{"data":[…]}` is the documented shape; a bare array is also accepted. **An empty list is not an error**: many servers expose no `/models` route, so a typed model id is always available — in the popover on Windows/Linux and in the picker's « Use » field on macOS, shown whatever the fetch did.
+- **Chat** : `POST {base}/chat/completions`, body `{model, max_tokens: 4096, messages: [system, …history, user]}`. One `max_tokens` → `max_completion_tokens` retry when the server rejects the old name, so current OpenAI models work. Timeout 90 s.
+- **History is a separate slot** from Anthropic's (`Chat.compat_messages`). The two wire formats disagree — an Anthropic content array carrying `tool_use` blocks is not a valid OpenAI message — so switching provider switches history instead of silently flattening it and losing the tool results the next turn needs. `chat_reset` clears both.
+- **Context**, first turn only, same rule as the Anthropic path: a window contributes `Context — App: …, Window: …, URL: …`; a file has its **text contents inlined** (200 KB, UTF-8) above `File: <name>`, and a binary or oversized file is named only. On macOS this inlining is specific to `custom` — Google and OpenAI still get the filename alone, unchanged.
+- **Errors** : the provider's own `error.message` is surfaced, falling back to the first 200 characters of the body, prefixed with the HTTP status. A missing base URL or model is refused **before** any network request is made.
+- **No model default.** `ChatProvider.custom.defaultModel` is empty and `fetchModelsIfNeeded` never substitutes one: there is no `sonnet`/`flash`/`mini` hint for an unknown endpoint, so guessing would only 400 on the first send.
+- **Pill** : `ai_custom`, colour `#6E7BE8`, not `githubOnly` — it only ever reads files the user dropped on the island, which the App Store sandbox allows.
+- **Nothing is sent until the user sends a message.** The only calls Coucou makes unprompted are `GET {base}/models` when the model picker is opened.
+
+---
+
 ## 6. Mail (app Mail du Mac)
 
 - Vue `mail` : À (obligatoire, validation d'adresse), Objet (prérempli : nom du fichier), Message (optionnel, une ligne).

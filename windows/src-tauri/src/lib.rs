@@ -6,6 +6,7 @@ mod hooks;
 mod integrations;
 mod island;
 mod log;
+mod openai_compat;
 mod pipe;
 mod platform;
 mod secrets;
@@ -24,6 +25,7 @@ use claude::{Chat, ChatContext, ChatReply};
 use files::DroppedFile;
 use hooks::{HookPreview, HookStatus, HookTarget};
 use island::{PollGate, ScreenInfo};
+use openai_compat::ChatModel;
 use pipe::Pending;
 use settings::Settings;
 
@@ -85,6 +87,49 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     }
     // Keep the other window in step (island ⇄ settings window).
     let _ = app.emit("settings-changed", settings);
+}
+
+/// Changes only the chat fields, leaving every other setting alone.
+///
+/// `save_settings` replaces the whole struct, and two windows each keep their own
+/// full copy of it. Whichever saved last won, so picking a provider in the island
+/// could be silently undone by an unrelated tweak in the settings window — which
+/// is exactly how a configured custom endpoint ended up back on Anthropic. A
+/// narrow patch cannot carry a stale copy of the fields it does not touch.
+#[tauri::command]
+fn chat_set(
+    app: AppHandle,
+    shared: State<'_, Shared>,
+    provider: Option<String>,
+    model: Option<String>,
+    custom_base_url: Option<String>,
+    custom_model: Option<String>,
+) {
+    let updated = {
+        let mut current = shared.settings.lock().unwrap();
+        if let Some(value) = provider {
+            current.chat_provider = value;
+        }
+        if let Some(value) = model {
+            current.model = value;
+        }
+        if let Some(value) = custom_base_url {
+            current.custom_base_url = value;
+        }
+        if let Some(value) = custom_model {
+            current.custom_model = value;
+        }
+        let mut updated = current.clone();
+        // `save_settings` normally gets this from the front end; here it has to
+        // happen ourselves or a hand-edited provider would sit on disk unvalidated.
+        updated.clamp();
+        *current = updated.clone();
+        if let Err(err) = settings::save(&current) {
+            eprintln!("[coucou] could not save settings: {err}");
+        }
+        updated
+    };
+    let _ = app.emit("settings-changed", updated);
 }
 
 /// Hidden island → shrink the window to the invisible wake strip and park the
@@ -276,6 +321,9 @@ fn approval_decline(app: AppHandle, request_id: String) {
 // ── Chat, files and secrets ───────────────────────────────────────────────────
 
 /// One chat turn. The API key and any file bytes stay on the Rust side.
+///
+/// Which provider answers is a stored setting, read here rather than passed in,
+/// so the island cannot ask a different provider than the user configured.
 #[tauri::command]
 async fn chat_send(
     shared: State<'_, Shared>,
@@ -283,8 +331,35 @@ async fn chat_send(
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
+    let (provider, model, base_url) = {
+        let current = shared.settings.lock().unwrap();
+        (
+            current.chat_provider.clone(),
+            current.model.clone(),
+            current.custom_base_url.clone(),
+        )
+    };
+
+    if provider == settings::PROVIDER_CUSTOM {
+        let cfg = openai_compat::config_for_chat(&base_url, &shared.settings.lock().unwrap().custom_model)?;
+        return openai_compat::send(&chat, &cfg, query, context).await;
+    }
+
     claude::send(&chat, &model, query, context).await
+}
+
+/// The models the custom endpoint advertises, for the in-chat picker.
+///
+/// Deliberately built without a model: this is the call you make to *find* one,
+/// so requiring `custom_model` to be set first would make the button unusable.
+/// An empty list is still a valid answer — plenty of servers expose no `/models`
+/// route, and the picker falls back to typing the id. Only Anthropic is absent
+/// here, because Anthropic has no picker on this platform yet.
+#[tauri::command]
+async fn chat_models(shared: State<'_, Shared>) -> Result<Vec<ChatModel>, String> {
+    let base_url = shared.settings.lock().unwrap().custom_base_url.clone();
+    let cfg = openai_compat::endpoint_from(&base_url)?;
+    openai_compat::fetch_models(&cfg).await
 }
 
 #[tauri::command]
@@ -419,6 +494,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,
+            chat_set,
             set_collapsed,
             set_island_rect,
             focus_window,
@@ -435,6 +511,7 @@ pub fn run() {
             approval_decline,
             log_line,
             chat_send,
+            chat_models,
             chat_reset,
             ingest_file,
             secret_present,

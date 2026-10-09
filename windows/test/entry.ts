@@ -10,3 +10,4 @@
 export { Island } from "../src/island/island";
 export { IslandStateMachine } from "../src/island/fsm";
 export { State } from "../src/core/state";
+export { run } from "./suite";

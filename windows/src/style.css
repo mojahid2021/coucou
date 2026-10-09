@@ -948,6 +948,202 @@ input[type="range"]::-webkit-slider-thumb {
   transform: scale(0.94);
 }
 
+/* ── Provider / model capsule ────────────────────────────────────────────── */
+/* Values copied from PromptView + ModelPickerView on macOS. */
+
+.provider-row {
+  position: relative;
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 10px;
+}
+
+.provider-capsule {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--dim-2);
+  font: 500 10.5px var(--font);
+  cursor: default;
+  transition: background 0.2s ease-out;
+}
+
+.provider-capsule:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.provider-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: var(--dim-3);
+}
+
+.provider-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-capsule svg {
+  flex: 0 0 auto;
+  color: var(--dim-3);
+}
+
+/* Anchored under the capsule. `overflow: hidden` on the island would otherwise
+   clip it, so it grows the card while it is open and the height is re-measured
+   by the chat view. */
+.model-popover-slot {
+  display: contents;
+}
+
+.model-popover {
+  position: absolute;
+  right: 10px;
+  bottom: calc(100% + 6px);
+  z-index: 40;
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 14px;
+  background: #16171b;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.55);
+}
+
+.model-chips {
+  display: flex;
+  gap: 6px;
+}
+
+.model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--ink-2);
+  font: 400 12px var(--font);
+  cursor: default;
+  transition: background 0.2s ease-out, border-color 0.2s ease-out;
+}
+
+.model-chip-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+}
+
+.model-chip.on {
+  font-weight: 600;
+}
+
+.model-list {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #c8cdd4;
+  font: 400 12px var(--font);
+  text-align: left;
+  cursor: default;
+}
+
+.model-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.model-row.on {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* The id, and the optional detail line under it. Both truncate so a long id
+   cannot widen the 300px popover. */
+.model-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.model-row-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-row-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 400 10.5px var(--font);
+  color: var(--dim-3);
+}
+
+.model-row.on .model-row-detail {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.model-hint {
+  font: 400 12px var(--font);
+  color: #8a8f98;
+}
+
+.model-hint.dim {
+  font-size: 11px;
+  color: var(--dim-3);
+  overflow-wrap: anywhere;
+}
+
+.model-manual-row {
+  padding-top: 2px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.model-manual {
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink);
+  font: 400 12px var(--font);
+  outline: none;
+}
+
+.model-manual:focus {
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
 /* ── Drop zone ──────────────────────────────────────────────────────────── */
 
 .drop-card {

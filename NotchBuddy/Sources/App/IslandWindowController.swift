@@ -224,6 +224,9 @@ final class IslandWindowController: NSWindowController {
         fsm.isHeldOpen = { AppState.shared.pendingApproval != nil }
         // Live work holds the island open; idle lets the clock run.
         fsm.isBusy = { AppState.shared.hasActiveWork }
+        // Hover pauses the clock instead of resetting it, so a cursor resting on
+        // the card never folds it under the user.
+        fsm.isPointerOver = { AppState.shared.pointerOverIsland }
         // The auto-close delay is a user setting, so the FSM cannot keep its own
         // constant. Rebound whenever Settings writes a new value.
         fsm.homeToPetitDelay = AppState.shared.autoCloseInterval
@@ -287,7 +290,10 @@ final class IslandWindowController: NSWindowController {
             fsm.busyStateChanged()
         }
 
-        // Feed FSM hover enter/leave
+        // Feed FSM hover enter/leave. The pointer flag goes first: `onTransition`
+        // → `armAutoCollapse()` reads it, so a stale value would arm a clock the
+        // user then has to sit out.
+        state.pointerOverIsland = inIsland
         if inIsland && !wasInIsland {
             guard !inAttachDrag else { wasInIsland = inIsland; return }
             // If in coucou: tell greeting to stay open (tc → infinity)

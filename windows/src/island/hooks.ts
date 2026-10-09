@@ -168,6 +168,29 @@ function clearSession(pillId: string) {
   t.pillBadge = null;
 }
 
+/**
+ * Steps recorded for the turn currently in flight, per pill.
+ *
+ * `steps.length` cannot answer this — it counts the whole session, so a long
+ * session makes every turn look busy and the celebration gate below would fire
+ * on the one-line edit it exists to stay quiet for. Reset at the start of each
+ * turn and counted as steps arrive.
+ */
+const turnSteps = new Map<string, number>();
+
+function countTurnStep(pillId: string) {
+  turnSteps.set(pillId, (turnSteps.get(pillId) ?? 0) + 1);
+}
+
+function beginTurn(pillId: string) {
+  turnSteps.set(pillId, 0);
+}
+
+/** Steps done in this turn so far — what the celebration gate is judged on. */
+function turnStepCount(pillId: string): number {
+  return turnSteps.get(pillId) ?? 0;
+}
+
 export function registerHookHandlers(island: Island) {
   void onEvent<HookPayload>("hook", (payload) => handleHook(island, payload));
 }
@@ -242,10 +265,16 @@ function handleHook(island: Island, payload: HookPayload) {
 
     case "UserPromptSubmit": {
       ensurePill();
+      // A new turn starts here: the celebration gate is judged on this turn's
+      // steps, not on the whole session's history.
+      beginTurn(agentId);
       State.updateTask(agentId, "thinking");
       // The field is `prompt`; reading `message` meant this step was always blank.
       const asked = payload.prompt ?? payload.message;
-      if (asked) State.appendStep(agentId, asked.slice(0, 60));
+      if (asked) {
+        countTurnStep(agentId);
+        State.appendStep(agentId, asked.slice(0, 60));
+      }
       surface("overview", false);
       break;
     }
@@ -254,6 +283,7 @@ function handleHook(island: Island, payload: HookPayload) {
       ensurePill();
       State.updateTask(agentId, "working");
       const tool = payload.tool_name ?? "Tool";
+      countTurnStep(agentId);
       State.appendStep(agentId, stepLabel(tool, payload.tool_input ?? {}));
       surface("overview", false);
       break;
@@ -265,6 +295,7 @@ function handleHook(island: Island, payload: HookPayload) {
 
     case "PostToolUseFailure":
       State.updateTask(agentId, "working");
+      countTurnStep(agentId);
       State.appendStep(agentId, "⚠ failed");
       break;
 
@@ -276,23 +307,27 @@ function handleHook(island: Island, payload: HookPayload) {
         Sound.play("rate");
       } else if (message.endsWith("?")) {
         State.updateTask(agentId, "question");
+        countTurnStep(agentId);
         State.appendStep(agentId, message);
       }
       break;
     }
 
     case "Stop": {
-      const stepsBefore = State.tasks.find((t) => t.id === agentId)?.steps.length ?? 0;
+      // This turn's step count, not `steps.length` — that counts the whole session,
+      // so a long session would make even a one-line edit look worth celebrating.
+      const stepsThisTurn = turnStepCount(agentId);
       State.updateTask(agentId, "finished");
       if (payload.message) State.appendStep(agentId, payload.message.slice(0, 60));
       Sound.play("finish");
       // A turn that actually did something earns a celebration; a one-line edit
       // does not. Counted before the Stop's own message was appended.
-      island.celebrateIfWorthIt(stepsBefore);
+      island.celebrateIfWorthIt(stepsThisTurn);
       if (focused) surface("finished", true);
       else State.setPillBadge(agentId, "finished");
       window.setTimeout(() => {
         if (isExternalAgent) {
+          turnSteps.delete(agentId);
           State.removeTask(agentId);
         } else {
           State.updateTask(agentId, "idle");
@@ -311,18 +346,22 @@ function handleHook(island: Island, payload: HookPayload) {
 
     case "SessionEnd":
       if (isExternalAgent) {
+        turnSteps.delete(agentId);
         State.removeTask(agentId);
       } else {
+        turnSteps.delete(agentId);
         State.updateTask(agentId, "idle");
         clearSession(agentId);
       }
       break;
 
     case "SubagentStart":
+      countTurnStep(agentId);
       State.appendStep(agentId, "+ subagent");
       break;
 
     case "SubagentStop":
+      countTurnStep(agentId);
       State.appendStep(agentId, "• subagent done");
       break;
 

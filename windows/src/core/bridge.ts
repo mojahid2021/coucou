@@ -35,6 +35,21 @@ export const Bridge = {
 
   saveSettings: (settings: Settings) => call<void>("save_settings", { settings }),
 
+  /**
+   * Changes only the chat fields.
+   *
+   * Both windows keep their own copy of the whole `Settings`, and `saveSettings`
+   * replaces all of it — so whoever saved last won, and a provider picked in the
+   * island could be silently reverted by an unrelated tweak in Settings. Patching
+   * a narrow set of fields cannot carry a stale copy of the rest.
+   */
+  chatSet: (patch: {
+    provider?: string;
+    model?: string;
+    customBaseUrl?: string;
+    customModel?: string;
+  }) => call<void>("chat_set", patch),
+
   /** Shrink the window down to the invisible wake strip (hidden) or back to full. */
   setCollapsed: (collapsed: boolean) => call<void>("set_collapsed", { collapsed }),
 
@@ -89,6 +104,12 @@ export const Bridge = {
   /** One chat turn. The API key and any file bytes never leave Rust. */
   chatSend: (query: string, context: ChatContext | null) =>
     callOrThrow<{ text: string }>("chat_send", { query, context }),
+  /**
+   * The models the custom endpoint advertises. An empty list is normal — plenty
+   * of servers expose no `/models` route and the picker falls back to typing the
+   * id — so only a rejected request throws.
+   */
+  chatModels: () => callOrThrow<ChatModel[]>("chat_models"),
   chatReset: () => call<void>("chat_reset"),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
@@ -121,6 +142,29 @@ export interface DroppedFile {
   name: string;
   path: string;
   size: number;
+}
+
+/** What an endpoint says a model can do. Purely descriptive — nothing here
+ *  changes what we send. A server that reports none of it omits the block. */
+export interface ChatModelCapabilities {
+  toolCalling?: boolean;
+  reasoning?: boolean;
+  thinking?: boolean;
+  vision?: boolean;
+}
+
+/** One entry from a custom endpoint's `/models` route.
+ *
+ *  The metadata fields are all optional: a classic OpenAI response has none of
+ *  them and must keep working exactly as before. */
+export interface ChatModel {
+  id: string;
+  /** Always equal to `id` — the id is what goes on the wire. */
+  label: string;
+  contextLength?: number;
+  maxOutputTokens?: number;
+  inputModalities?: string[];
+  capabilities?: ChatModelCapabilities;
 }
 
 /** Which harness a hook file belongs to. The Rust side accepts an absent target

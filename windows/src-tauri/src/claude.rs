@@ -22,7 +22,10 @@ const MAX_INLINE_TEXT: u64 = 200_000;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 
-const SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assistant living at the top of the user's screen. \
+/// One Mochi persona for every provider. The custom OpenAI-compatible endpoint
+/// speaks a different wire format but must not sound like a different assistant,
+/// so both paths read the same wording.
+pub(crate) const SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assistant living at the top of the user's screen. \
 You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
 Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
 No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.";
@@ -31,11 +34,19 @@ No markdown formatting (no **, no ##, no bullet dashes). Use plain text with lin
 pub struct Chat {
     /// Full multi-turn history, including tool_use / tool_result blocks.
     messages: Mutex<Vec<Value>>,
+    /// The OpenAI-compatible history: `{role, content}` pairs with plain-string
+    /// content. It is a *separate* slot, not a remapped view of `messages`, because
+    /// the two wire formats disagree: Anthropic content arrays carrying tool_use
+    /// blocks are not valid OpenAI messages, and silently flattening them would
+    /// lose the tool results the next turn needs. Switching provider therefore
+    /// switches history instead of corrupting it.
+    compat_messages: Mutex<Vec<(String, String)>>,
 }
 
 impl Chat {
     pub fn reset(&self) {
         self.messages.lock().unwrap().clear();
+        self.compat_messages.lock().unwrap().clear();
     }
 
     fn is_empty(&self) -> bool {
@@ -52,6 +63,20 @@ impl Chat {
 
     fn snapshot(&self) -> Vec<Value> {
         self.messages.lock().unwrap().clone()
+    }
+
+    // ── OpenAI-compatible history ────────────────────────────────────────────
+
+    pub(crate) fn compat_push(&self, role: &str, content: String) {
+        self.compat_messages.lock().unwrap().push((role.to_string(), content));
+    }
+
+    pub(crate) fn compat_pop(&self) {
+        self.compat_messages.lock().unwrap().pop();
+    }
+
+    pub(crate) fn compat_snapshot(&self) -> Vec<(String, String)> {
+        self.compat_messages.lock().unwrap().clone()
     }
 }
 
@@ -218,12 +243,21 @@ fn file_block(path: &str) -> Option<Value> {
         }));
     }
 
+    file_as_text(path).map(|text| json!({ "type": "text", "text": format!("File contents:\n{text}") }))
+}
+
+/// Reads a text/code file whole, or returns None.
+///
+/// Shared with the OpenAI-compatible path, which has no document/image block to
+/// put a PDF in and so only ever sends the text side. A binary file, an oversized
+/// one, or anything that is not UTF-8 comes back None and the caller falls back
+/// to naming the file rather than sending garbage.
+pub(crate) fn file_as_text(path: &str) -> Option<String> {
     let len = std::fs::metadata(path).ok()?.len();
     if len > MAX_INLINE_TEXT {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    Some(json!({ "type": "text", "text": format!("File contents:\n{text}") }))
+    std::fs::read_to_string(path).ok()
 }
 
 /// Small standalone base64 encoder — not worth another dependency.

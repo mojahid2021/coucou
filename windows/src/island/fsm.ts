@@ -22,6 +22,10 @@ export class IslandStateMachine {
    *  auto-expands and no auto-close timer runs: an island showing live work
    *  must not fold under the user. */
   isBusy: () => boolean = () => false;
+  /** True while the pointer is over the island. Hovering *pauses* the auto-close
+   *  clock rather than resetting it: a cursor resting on a card the user is
+   *  reading must not fold it, and leaving restarts the full delay. */
+  isPointerOver: () => boolean = () => false;
   /** hidden → home after this long hovering the notch. */
   peekExpandDelay = 0.65;
   /** petit → home after this long hovering the compact island. */
@@ -29,12 +33,19 @@ export class IslandStateMachine {
   /** Hard ceiling on how long live work may hold the island open, in ms. A
    *  `Stop` that never arrives would otherwise keep the card expanded for good. */
   busyMaxHold = 600_000;
+  /** Hard ceiling on one *continuous* hover, in ms. Pausing is better than
+   *  pinning, but a pause with no end is a pin: on Wayland a leave is reported
+   *  only by `mouseleave` on the island element, so losing that signal must not
+   *  be able to strand the card open forever. */
+  hoverMaxHold = 600_000;
 
   private petitHide: number | null = null;
   private homeCollapse: number | null = null;
   private greetCollapse: number | null = null;
   private dwellExpand: number | null = null;
   private busySince: number | null = null;
+  /** Stamped on the pointer-over edge, so the ceiling counts this hover only. */
+  private hoverSince: number | null = null;
 
   // ── Inputs ──────────────────────────────────────────────────────────────────
 
@@ -44,6 +55,7 @@ export class IslandStateMachine {
   }
 
   mouseEntered() {
+    this.stampHoverEdge();
     switch (this.state) {
       case "hidden":
         if (this.isBusy()) {
@@ -62,8 +74,12 @@ export class IslandStateMachine {
         if (!this.pinned) this.scheduleDwellExpand(this.compactExpandDelay);
         break;
       case "home":
-        // Interaction resets the auto-close clock.
-        this.resetActivity();
+        // Hover pauses the auto-close clock instead of resetting it. Clearing
+        // the timer outright would arm nothing at all, so the ceiling could
+        // never fire and a lost leave signal would pin the island forever —
+        // `scheduleHomeCollapse` picks the ceiling branch while the pointer is
+        // over, which is what makes this a pause rather than a pin.
+        this.scheduleHomeCollapse();
         break;
       case "coucou":
         this.scheduleGreetCollapse(this.greetHoverCollapseDelay);
@@ -73,6 +89,7 @@ export class IslandStateMachine {
 
   mouseLeft() {
     this.clear("dwellExpand");
+    this.hoverSince = null;
     switch (this.state) {
       case "hidden":
         break;
@@ -80,8 +97,8 @@ export class IslandStateMachine {
         this.schedulePetitHide();
         break;
       case "home":
-        // Leaving does not close the island, but the auto-close clock keeps
-        // running: it was armed when `home` was entered, not here.
+        // Leaving does not close the island, but the pause is over: the clock
+        // restarts from the full delay now that the pointer is gone.
         this.scheduleHomeCollapse();
         break;
       case "coucou":
@@ -101,6 +118,18 @@ export class IslandStateMachine {
   armAutoCollapse() {
     if (this.state !== "home") return;
     this.scheduleHomeCollapse();
+  }
+
+  /**
+   * Marks the start of a continuous hover, once per pointer-over edge.
+   *
+   * `mouseEntered` is called both by the DOM `mouseenter` and by the 60 Hz cursor
+   * poll, so stamping unconditionally would restart the ceiling several times a
+   * second and the island could then be held open indefinitely.
+   */
+  private stampHoverEdge() {
+    if (!this.isPointerOver()) return;
+    if (this.hoverSince == null) this.hoverSince = performance.now();
   }
 
   /** Work state changed (an agent started or went idle). */
@@ -175,6 +204,11 @@ export class IslandStateMachine {
 
   private schedulePetitHide() {
     this.clear("petitHide");
+    // A pointer resting on the compact bar pauses its auto-hide, exactly as it
+    // pauses the fold of the expanded card. In practice the dwell expand wins
+    // first, but a pin that never expires is not a pause, so the ceiling below
+    // still has to exist for this clock.
+    if (this.isPointerOver() && !this.pinned) return;
     this.petitHide = window.setTimeout(() => {
       this.petitHide = null;
       if (this.state === "petit") this.transition("hidden");
@@ -193,6 +227,13 @@ export class IslandStateMachine {
       const held = this.busySince == null ? 0 : performance.now() - this.busySince;
       delay = Math.max(0, this.busyMaxHold - held);
       if (delay <= 0) return;
+    } else if (this.isPointerOver()) {
+      // Hover pauses rather than resets: a cursor resting on a card the user is
+      // reading must not fold it. Only the ceiling still runs, so a hover pauses
+      // the fold without being able to pin the island open forever.
+      const held = this.hoverSince == null ? 0 : performance.now() - this.hoverSince;
+      delay = Math.max(0, this.hoverMaxHold - held);
+      if (delay <= 0) return;
     } else {
       delay = this.homeToPetitDelay * 1000;
     }
@@ -200,11 +241,15 @@ export class IslandStateMachine {
     this.homeCollapse = window.setTimeout(() => {
       this.homeCollapse = null;
       if (this.state !== "home" || this.pinned) return;
-      // The busy hold expires on wall-clock, not on "the callback happened to be
+      // Both holds expire on wall-clock, not on "the callback happened to be
       // early": a timer that fires a millisecond early must re-arm for the
       // remainder instead of returning and leaving the island open forever.
       if (this.isBusy()) {
         const left = this.busyMaxHold - (performance.now() - (this.busySince ?? performance.now()));
+        if (left > 0) { this.scheduleHomeCollapse(); return; }
+      }
+      if (this.isPointerOver()) {
+        const left = this.hoverMaxHold - (performance.now() - (this.hoverSince ?? performance.now()));
         if (left > 0) { this.scheduleHomeCollapse(); return; }
       }
       this.transition("petit");
@@ -243,6 +288,9 @@ export class IslandStateMachine {
     this.clear("homeCollapse");
     this.clear("greetCollapse");
     this.clear("dwellExpand");
+    // A cancelled clock is not a pause: the next hover is a fresh one, so the
+    // ceiling must not keep counting from a hover that is already over.
+    this.hoverSince = null;
   }
 
   private transition(next: FsmState) {

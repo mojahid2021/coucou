@@ -403,9 +403,11 @@ struct CountdownBar: View {
     }
 
     private func updateBar() {
-        // No bar while an alert is pinned or work is running: the FSM holds the
-        // island open in both cases, so a draining bar would be a lie.
-        guard state.mode == .expanded && !state.isPinned && !state.hasActiveWork else {
+        // No bar while an alert is pinned, work is running, or the pointer is on
+        // the island: the FSM holds it open in all three cases (hovering pauses
+        // the clock), so a draining bar would be a lie.
+        guard state.mode == .expanded && !state.isPinned && !state.hasActiveWork
+                && !state.pointerOverIsland else {
             barWidth = 0
             return
         }

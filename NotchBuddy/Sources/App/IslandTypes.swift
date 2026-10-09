@@ -67,7 +67,10 @@ struct AgentTask: Identifiable, Equatable {
     var name: String
     var color: String          // hex
     var state: BotState
+    /// Index of the newest step in `steps`. Always `steps.count - 1`.
     var stepIndex: Int = 0
+    /// Every step this session has produced, oldest first. Uncapped: the history
+    /// is what the counter and the ticker read, so truncating it froze both.
     var steps: [String]
     var source: AgentSource
     var isIntegration: Bool = false  // true for persistent integration pills
@@ -89,12 +92,16 @@ enum ChatProvider: String, CaseIterable, Codable {
     case anthropic = "anthropic"
     case google    = "google"
     case openai    = "openai"
+    /// Any OpenAI-compatible endpoint the user configures themselves: Ollama,
+    /// LM Studio, OpenRouter, Groq, vLLM, Azure, OpenAI itself.
+    case custom    = "custom"
 
     var displayName: String {
         switch self {
         case .anthropic: "Anthropic"
         case .google:    "Google"
         case .openai:    "OpenAI"
+        case .custom:    "Custom"
         }
     }
 
@@ -103,6 +110,7 @@ enum ChatProvider: String, CaseIterable, Codable {
         case .anthropic: "#E07950"
         case .google:    "#4285F4"
         case .openai:    "#10A37F"
+        case .custom:    "#6E7BE8"
         }
     }
 
@@ -111,6 +119,9 @@ enum ChatProvider: String, CaseIterable, Codable {
         case .anthropic: "claude-sonnet-4-6"
         case .google:    "gemini-2.0-flash"
         case .openai:    "gpt-4o"
+        // Deliberately empty: an endpoint Coucou knows nothing about has no
+        // sensible default model, and guessing would just 400 on the first send.
+        case .custom:    ""
         }
     }
 
@@ -119,7 +130,20 @@ enum ChatProvider: String, CaseIterable, Codable {
         case .anthropic: "anthropic-api-key"
         case .google:    "google-api-key"
         case .openai:    "openai-api-key"
+        case .custom:    "custom-api-key"
         }
+    }
+
+    /// `.custom` is the only provider whose base URL the user supplies, so it is
+    /// also the only one whose key may legitimately be absent — a local Ollama
+    /// answers without any auth at all.
+    var keyIsOptional: Bool { self == .custom }
+
+    /// The configured base URL, validated. Nil for any other provider, and for a
+    /// custom one that has never been set or has been set to something unsafe —
+    /// which is what the `ai_custom` pill reports on.
+    func normalizedBaseURL(_ raw: String) -> String? {
+        self == .custom ? ClaudeService.normalizedChatBaseURL(raw) : nil
     }
 }
 

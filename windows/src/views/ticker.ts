@@ -6,11 +6,15 @@
 // reset timer let two rows land on the same line when steps arrived in bursts,
 // and any step that arrived mid-animation was dropped outright. Steps are now
 // queued instead, so a burst scrolls past rather than vanishing.
+//
+// Positions are indices into `steps`, which is uncapped: the 20-entry ring buffer
+// it replaced pinned the index at 20 and the ticker froze solid for the rest of
+// a long session.
 
 import { h, svg } from "./dom";
 import { ICONS } from "./icons";
 import { cubicBezier, clamp, lerp } from "../core/anim";
-import type { AgentTask } from "../core/state";
+import { stepsSince, type AgentTask } from "../core/state";
 
 const ROW_H = 22;
 /** One step transition, milliseconds. */
@@ -77,7 +81,6 @@ export class Ticker {
   private c = makeRow(); // incoming
   private queue: string[] = [];
   private startMs: number | null = null;
-  private displayIndex = -1;
 
   constructor() {
     this.el = h("div", { class: "ticker" }, this.a.el, this.b.el, this.c.el);
@@ -91,39 +94,68 @@ export class Ticker {
     place(this.c, ROW_H * 2, 0, 0);
   }
 
+  /**
+   * Newest step index it has been shown.
+   *
+   * This used to be compared against `steps.length`, which only worked while the
+   * history was capped — at the cap both stopped moving and the queue loop went
+   * empty, so the ticker silently stopped for the rest of the session. The
+   * history is uncapped now, so an index is a real position.
+   */
+  private displayIndex = -1;
+
+  /** Newest step index shown. Exposed for the test suite. */
+  get shownStep(): number {
+    return this.displayIndex;
+  }
+
+  /** Labels still waiting to scroll in. Exposed for the test suite. */
+  get pending(): readonly string[] {
+    return this.queue;
+  }
+
+  /** Label currently on the "current" row. Exposed for the test suite. */
+  get currentText(): string {
+    return this.b.text;
+  }
+
   get animating(): boolean {
     return this.startMs != null || this.queue.length > 0;
   }
 
+  /** Places the two resting rows at `idx` without animating. */
+  private seed(steps: string[], idx: number) {
+    this.displayIndex = idx;
+    setText(this.a, idx > 0 ? steps[idx - 1] : "…");
+    setText(this.b, steps[Math.max(idx, 0)] ?? "…");
+    this.rest();
+  }
+
   sync(task: AgentTask | null) {
     const steps = task && task.steps.length > 0 ? task.steps : ["…"];
-    const idx = task ? Math.min(task.stepIndex, steps.length - 1) : -1;
+    const idx = task ? task.stepIndex : -1;
 
     // First render: drop straight into place, no animation.
     if (this.displayIndex < 0) {
-      this.displayIndex = idx;
-      setText(this.a, idx > 0 ? steps[idx - 1] : "…");
-      setText(this.b, steps[Math.max(idx, 0)]);
-      this.rest();
+      this.seed(steps, idx);
       return;
     }
 
-    // The session restarted (steps were cleared): re-seed rather than scroll.
+    // The session restarted (steps were cleared): re-seed rather than scroll
+    // through a history that no longer exists.
     if (idx < this.displayIndex) {
       this.queue = [];
       this.startMs = null;
-      this.displayIndex = idx;
-      setText(this.a, idx > 0 ? steps[idx - 1] : "…");
-      setText(this.b, steps[Math.max(idx, 0)]);
-      this.rest();
+      this.seed(steps, idx);
       return;
     }
 
-    for (let i = this.displayIndex + 1; i <= idx; i++) this.queue.push(steps[i]);
+    if (task === null || idx === this.displayIndex) return;
+
+    // A burst scrolls past rather than trying to replay all of it: `stepsSince`
+    // keeps the newest MAX_QUEUE of them.
+    this.queue.push(...stepsSince(task, this.displayIndex, MAX_QUEUE));
     this.displayIndex = idx;
-    if (this.queue.length > MAX_QUEUE) {
-      this.queue = this.queue.slice(-MAX_QUEUE);
-    }
   }
 
   /** Called every frame by the island while the overview is on screen. */

@@ -102,6 +102,11 @@ export class Island {
   /** Last shape handed to Rust for the click-through test. */
   private pushedRect = { x: -1, y: -1, w: -1, h: -1 };
   private homeCollapseAt: number | null = null;
+  /** Whether the pointer is over the island, sampled before every FSM hover
+   *  call. The FSM reads this to pause the auto-close clock, and the ordering
+   *  matters: `onTransition` → `armAutoCollapse()` reads it too, so a stale value
+   *  would arm a clock the user then has to sit out. */
+  private pointerOverIsland = false;
   /** Last cursor position over the island, used to turn per-frame cursor samples
    *  into discrete "the user moved" activity events. */
   private lastActivityPt = { x: 0, y: 0 };
@@ -264,6 +269,7 @@ export class Island {
   private wireFsm() {
     this.fsm.homeToPetitDelay = State.settings.autoCloseInterval;
     this.fsm.isBusy = () => State.hasActiveWork;
+    this.fsm.isPointerOver = () => this.pointerOverIsland;
     this.fsm.onTransition = (from, to) => {
       switch (to) {
         case "hidden":
@@ -669,6 +675,9 @@ export class Island {
     if (State.mode === "hidden") return;
     const wasInside = this.wasInIsland;
     this.wasInIsland = false;
+    // Before `mouseLeft()`: the FSM ends the hover pause on this edge, and it
+    // reads the flag to know the pause is over.
+    this.pointerOverIsland = false;
     this.fsm.mouseLeft();
     if (wasInside) this.armCollapseCountdown();
   }
@@ -682,7 +691,8 @@ export class Island {
    * bar that never emptied. One entry point keeps them in step.
    */
   private armCollapseCountdown() {
-    if (this.fsm.state !== "home" || State.isPinned || State.hasActiveWork) {
+    if (this.fsm.state !== "home" || State.isPinned || State.hasActiveWork
+        || this.pointerOverIsland) {
       this.homeCollapseAt = null;
       return;
     }
@@ -696,6 +706,7 @@ export class Island {
       Sound.resume();
       if (State.mode === "hidden") {
         this.watchdogUntil = performance.now() + 600;
+        this.pointerOverIsland = true;
         this.fsm.mouseEntered();
       }
     });
@@ -720,6 +731,8 @@ export class Island {
       if (this.fsm.state === "coucou") this.greeting.hover();
       this.wasInIsland = true;
       this.watchdogUntil = performance.now() + 600;
+      // Before `mouseEntered()`: the FSM reads the flag to start the pause.
+      this.pointerOverIsland = true;
       this.fsm.mouseEntered();
       this.armCollapseCountdown();
     });
@@ -830,10 +843,18 @@ export class Island {
 
     if (inIsland && !this.wasInIsland) {
       if (this.fsm.state === "coucou") this.greeting.hover();
+      this.pointerOverIsland = true;
       this.fsm.mouseEntered();
       this.armCollapseCountdown();
+    } else if (!inIsland && this.wasInIsland) {
+      this.markMouseOutside();
+    } else if (!inIsland) {
+      // Already outside before this sample. The wake strip sets the flag before
+      // the FSM has seen a single poll, so leaving the strip without reaching the
+      // island has to clear it here — otherwise the clock stays paused over a
+      // compact bar the pointer is nowhere near.
+      this.pointerOverIsland = false;
     }
-    if (!inIsland && this.wasInIsland) this.markMouseOutside();
     this.wasInIsland = inIsland;
 
     // Moving the mouse over the open island counts as activity, so the delay is
@@ -1308,10 +1329,11 @@ export class Island {
   }
 
   private updateCountdown(nowMs: number) {
-    // No bar while an alert is pinned or work is running: the FSM holds the
-    // island open in both cases, so a draining bar would be a lie.
+    // No bar while an alert is pinned, work is running, or the pointer is on the
+    // island: the FSM holds it open in all three cases (hovering pauses the
+    // clock), so a draining bar would be a lie.
     if (State.mode !== "expanded" || State.isPinned || State.hasActiveWork
-        || this.homeCollapseAt == null) {
+        || this.pointerOverIsland || this.homeCollapseAt == null) {
       this.countdown.style.width = "0px";
       return;
     }

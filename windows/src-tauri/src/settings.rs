@@ -25,10 +25,34 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Which provider answers the chat: "anthropic" or "custom".
+    #[serde(default = "default_chat_provider")]
+    pub chat_provider: String,
+    /// Base URL of the user's OpenAI-compatible endpoint, e.g. an Ollama server.
+    /// Not a secret — the key, if any, lives in the keychain.
+    #[serde(default)]
+    pub custom_base_url: String,
+    /// Model id sent to that endpoint.
+    #[serde(default)]
+    pub custom_model: String,
 }
 
 fn default_model() -> String {
     crate::claude::DEFAULT_MODEL.to_string()
+}
+
+fn default_chat_provider() -> String {
+    PROVIDER_ANTHROPIC.to_string()
+}
+
+/// The two providers the chat knows about. Anything else in `chat_provider` is
+/// rewritten to Anthropic by `clamp`, so a typo or a hand-edited file cannot
+/// leave the island with no way to answer.
+pub const PROVIDER_ANTHROPIC: &str = "anthropic";
+pub const PROVIDER_CUSTOM: &str = "custom";
+
+pub fn is_known_provider(value: &str) -> bool {
+    matches!(value, PROVIDER_ANTHROPIC | PROVIDER_CUSTOM)
 }
 
 impl Default for Settings {
@@ -49,6 +73,9 @@ impl Default for Settings {
             hooks_installed: false,
             copilot_hooks_installed: false,
             model: default_model(),
+            chat_provider: default_chat_provider(),
+            custom_base_url: String::new(),
+            custom_model: String::new(),
         }
     }
 }
@@ -86,6 +113,17 @@ impl Settings {
             self.auto_close_interval = 15.0;
         }
         self.auto_close_interval = self.auto_close_interval.clamp(lo, hi);
+
+        // An unknown provider would leave the island unable to answer, so it
+        // falls back to the one that always works rather than being passed on.
+        self.chat_provider = self.chat_provider.trim().to_lowercase();
+        if !is_known_provider(&self.chat_provider) {
+            self.chat_provider = default_chat_provider();
+        }
+        // Trailing slashes are stripped on save; the endpoints are a plain join
+        // and `…/v1//chat/completions` is not the same URL.
+        self.custom_base_url = self.custom_base_url.trim().trim_end_matches('/').to_string();
+        self.custom_model = self.custom_model.trim().to_string();
     }
 }
 

@@ -15,7 +15,8 @@ const stub: Harness = installDom();
 
 const { Island } = await import("../src/island/island");
 const { IslandStateMachine } = await import("../src/island/fsm");
-const { State, isBusyState } = await import("../src/core/state");
+const { State, isBusyState, stepsSince } = await import("../src/core/state");
+const { Ticker } = await import("../src/views/ticker");
 const { BotEngine, EMOTE_SPECS, EMOTE_EYE, EMOTE_SOUND } = await import("../src/mochi/engine");
 const { SOUND_NAMES } = await import("../src/core/sound");
 
@@ -47,11 +48,14 @@ export async function run({ suite, test, assert, eq, sleep }: Ctx) {
 
   /** An FSM with the 10-minute busy ceiling set BEFORE anything arms a timer:
    *  `busyMaxHold` is read when the hold is scheduled, so a later assignment
-   *  would be ignored and the test would sit through the real 600 s default. */
-  function makeFsm(opts: { busy?: () => boolean; maxHold?: number } = {}) {
+   *  would be ignored and the test would sit through the real 600 s default.
+   *  Same for `hoverMaxHold`: it is read when the hover pause is armed. */
+  function makeFsm(opts: { busy?: () => boolean; maxHold?: number; pointerOver?: () => boolean; hoverHold?: number } = {}) {
     const fsm = new IslandStateMachine();
     fsm.maxHoldGuard;
     if (opts.maxHold != null) fsm.busyMaxHold = opts.maxHold;
+    if (opts.hoverHold != null) fsm.hoverMaxHold = opts.hoverHold;
+    if (opts.pointerOver) fsm.isPointerOver = opts.pointerOver;
     if (opts.busy) fsm.isBusy = opts.busy;
     const log: string[] = [];
     fsm.onTransition = (from, to) => log.push(`${from}->${to}`);
@@ -191,6 +195,128 @@ export async function run({ suite, test, assert, eq, sleep }: Ctx) {
     }
   });
 
+  // ── FSM: hovering pauses the clock (it does not reset it) ──────────────────
+
+  suite("FSM — hover pauses auto-close");
+
+  await test("a cursor resting on the card does not fold it", async () => {
+    let over = true;
+    const { fsm } = makeFsm({ pointerOver: () => over, hoverHold: 5000 });
+    fsm.homeToPetitDelay = 0.05;
+    fsm.click();
+    // Entering home armed a clock; the hover that got us here pauses it.
+    fsm.mouseEntered();
+    await sleep(250);
+    eq(fsm.state, "home", "a motionless cursor on the card must not fold it");
+  });
+
+  await test("leaving restarts the full delay", async () => {
+    let over = true;
+    const { fsm } = makeFsm({ pointerOver: () => over, hoverHold: 5000 });
+    fsm.homeToPetitDelay = 0.06;
+    fsm.click();
+    fsm.mouseEntered();
+    await sleep(150);
+    eq(fsm.state, "home", "precondition: still open under the pointer");
+
+    over = false;
+    fsm.mouseLeft();
+    // Well past homeToPetitDelay, but the leave just restarted it.
+    await sleep(20);
+    eq(fsm.state, "home", "the delay restarts on leave, it does not resume mid-count");
+    await sleep(160);
+    eq(fsm.state, "petit", "and it does fold once the fresh delay elapses");
+  });
+
+  await test("movement spam under the cursor cannot arm the clock", async () => {
+    // `resetActivity` is called on every mouse-move sample, so if it armed
+    // anything the island would stay open for as long as the mouse moved.
+    let over = true;
+    const { fsm } = makeFsm({ pointerOver: () => over, hoverHold: 5000 });
+    fsm.homeToPetitDelay = 0.06;
+    fsm.click();
+    fsm.mouseEntered();
+    for (let i = 0; i < 8; i++) {
+      await sleep(30);
+      fsm.resetActivity();
+    }
+    eq(fsm.state, "home", "still paused — activity under the pointer changes nothing");
+  });
+
+  await test("a continuous hover still hits the ceiling", async () => {
+    // Pausing must not be a quiet pin: a lost leave signal (Wayland reports one
+    // only through `mouseleave`) must not be able to strand the island open.
+    let over = true;
+    const { fsm } = makeFsm({ pointerOver: () => over, hoverHold: 120 });
+    fsm.homeToPetitDelay = 0.05;
+    fsm.click();
+    fsm.mouseEntered();
+    await sleep(90);
+    eq(fsm.state, "home", "still inside the hover ceiling");
+    await sleep(220);
+    eq(fsm.state, "petit", "the ceiling must not be able to wedge it open forever");
+  });
+
+  await test("the hover ceiling re-arms instead of expiring early", async () => {
+    // A timer that fires a millisecond early must recompute the remainder. The
+    // naive `if (left > 0) return` consumed the only timer and pinned the island.
+    let over = true;
+    const { fsm } = makeFsm({ pointerOver: () => over, hoverHold: 200 });
+    fsm.homeToPetitDelay = 0.05;
+    fsm.click();
+    fsm.mouseEntered();
+    await sleep(150);
+    eq(fsm.state, "home", "an early callback must not have folded it");
+    await sleep(200);
+    eq(fsm.state, "petit", "and the ceiling still applies afterwards");
+  });
+
+  await test("a repeated mouseEntered does not restart the hover ceiling", async () => {
+    // `mouseEntered` fires from both the DOM listener and the 60 Hz poll, so it
+    // can arrive twice for one physical entry. If each call re-stamped the hover
+    // edge, the ceiling would slide forward every time and the island could be
+    // held open indefinitely. The loop therefore runs well past hoverMaxHold
+    // while still hovering — only a single stamp can let it expire.
+    let over = true;
+    const { fsm } = makeFsm({ pointerOver: () => over, hoverHold: 200 });
+    fsm.homeToPetitDelay = 0.05;
+    fsm.click();
+    fsm.mouseEntered();
+    // ~450 ms of hovering, re-entering every 30 ms.
+    for (let i = 0; i < 15; i++) {
+      await sleep(30);
+      fsm.mouseEntered();
+    }
+    eq(fsm.state, "petit", "re-entering must not extend the ceiling past hoverMaxHold");
+  });
+
+  await test("hover also pauses the compact bar's 60 s auto-hide", async () => {
+    let over = true;
+    const { fsm } = makeFsm({ pointerOver: () => over, hoverHold: 5000 });
+    fsm.petitToHiddenDelay = 0.05;
+    fsm.compactExpandDelay = 100;   // hover alone must not expand in this test
+    fsm.mouseEntered();             // hidden → petit
+    eq(fsm.state, "petit", "precondition: compact");
+    fsm.mouseLeft();                // pointer flag is still true, so this is a pause
+    await sleep(200);
+    eq(fsm.state, "petit", "a pointer resting on the bar must not hide it");
+
+    over = false;
+    fsm.mouseLeft();
+    await sleep(150);
+    eq(fsm.state, "hidden", "and it hides once the pointer is gone");
+  });
+
+  await test("an idle island with nothing under it still folds on its own", async () => {
+    // The regression guard for the new branch: with no pointer over, the hover
+    // path must not swallow the ordinary countdown.
+    const { fsm } = makeFsm({ pointerOver: () => false });
+    fsm.homeToPetitDelay = 0.05;
+    fsm.click();
+    await sleep(150);
+    eq(fsm.state, "petit", "an untouched island still folds after the delay");
+  });
+
   // ── Bot state semantics ────────────────────────────────────────────────────
 
   suite("BotState — what counts as work");
@@ -203,6 +329,125 @@ export async function run({ suite, test, assert, eq, sleep }: Ctx) {
     for (const s of ["working", "thinking", "searching", "approval", "question", "error", "ratelimit"]) {
       assert(isBusyState(s as never), `${s} is work`);
     }
+  });
+
+  // ── Step history: the capped ring buffer ────────────────────────────────────
+
+  // The step history used to be a 20-entry ring buffer, and the counter and the
+  // ticker both read a count out of it. At the cap they stopped moving: the
+  // counter froze at `20/20` and the ticker's queue loop went empty, so it
+  // stopped dead for the rest of the session. The history is uncapped now, so
+  // `steps.length` is the real count and `stepIndex` a real position. These pin
+  // that down past the old limit, so the cap cannot creep back in.
+  suite("Step history — uncapped");
+
+  const seedTask = () => {
+    State.tasks = [{
+      id: "integration_claude", name: "VS Code", color: "#F5F6F8", state: "working",
+      stepIndex: 0, steps: [], source: "claudeCode", isIntegration: true,
+    }];
+    State.focusId = "integration_claude";
+    return State.tasks[0];
+  };
+
+  await test("the history keeps every step past the old 20 cap", async () => {
+    const t = seedTask();
+    for (let i = 1; i <= 200; i++) State.appendStep("integration_claude", `step ${i}`);
+
+    eq(t.steps.length, 200, "nothing is evicted — the old cap froze the count at 20");
+    eq(t.stepIndex, 199, "stepIndex stays a real position");
+    eq(t.steps.at(-1), "step 200", "the newest label is last");
+    eq(t.steps[0], "step 1", "the oldest label is still there");
+  });
+
+  await test("stepsSince returns the steps after a point, capped at max", async () => {
+    const t = seedTask();
+    for (let i = 1; i <= 30; i++) State.appendStep("integration_claude", `step ${i}`);
+
+    // `steps[i]` holds "step i+1", so index 27 is "step 28".
+    eq(JSON.stringify(stepsSince(t, 27, 4)), JSON.stringify(["step 29", "step 30"]),
+      "only the steps after the given index, oldest first");
+    eq(stepsSince(t, 29, 4).length, 0, "nothing new means nothing queued");
+    eq(stepsSince(t, 0, 4).length, 4, "a long run is truncated to max");
+    eq(stepsSince(t, 0, 4).at(-1), "step 30", "truncation keeps the NEWEST — the ticker must land on current work");
+    eq(stepsSince(t, 0, 4)[0], "step 27", "and drops the oldest of the new ones");
+  });
+
+  await test("clearing the history resets the index", async () => {
+    const t = seedTask();
+    for (let i = 1; i <= 30; i++) State.appendStep("integration_claude", `step ${i}`);
+    State.clearSteps("integration_claude");
+
+    eq(t.steps.length, 0, "the history empties");
+    eq(t.stepIndex, 0, "the index resets with it");
+
+    State.appendStep("integration_claude", "fresh");
+    eq(t.stepIndex, 0, "the count restarts on the next session");
+    eq(t.steps.length, 1, "and so does the history");
+  });
+
+  await test("the ticker keeps scrolling past the old 20 cap", async () => {
+    const t = seedTask();
+    const ticker = new Ticker();
+
+    // Walk well past the old limit one step at a time. `sync` queues, then two
+    // frames commit: the first starts the transition, the second finishes it.
+    for (let i = 1; i <= 25; i++) {
+      State.appendStep("integration_claude", `step ${i}`);
+      ticker.sync(t);
+      ticker.tick(i * 1000);
+      ticker.tick(i * 1000 + 1000);
+    }
+    // Let the final queued step land.
+    ticker.tick(30_000);
+
+    // 25 steps: the capped ticker stopped at 20 and showed nothing after.
+    eq(ticker.shownStep, 24, "the ticker tracks the newest index");
+    eq(ticker.currentText, "step 25", "the newest step is the one on screen");
+    eq(ticker.pending.length, 0, "the queue drains — steps are not piling up unseen");
+  });
+
+  await test("a restarted session re-seeds instead of animating backwards", async () => {
+    const t = seedTask();
+    const ticker = new Ticker();
+    for (let i = 1; i <= 25; i++) {
+      State.appendStep("integration_claude", `step ${i}`);
+      ticker.sync(t);
+      ticker.tick(i * 1000);
+      ticker.tick(i * 1000 + 1000);
+    }
+
+    State.clearSteps("integration_claude");
+    State.appendStep("integration_claude", "new session");
+    ticker.sync(t);
+
+    eq(ticker.shownStep, 0, "the index went backwards, so the ticker re-seeds");
+    eq(ticker.currentText, "new session", "the fresh session's label is shown");
+    eq(ticker.pending.length, 0, "a restart must not replay the dead history");
+  });
+
+  await test("a burst is truncated rather than dropped entirely", async () => {
+    const t = seedTask();
+    const ticker = new Ticker();
+    ticker.sync(t);
+    ticker.tick(0);
+    ticker.tick(10_000);
+
+    for (let i = 1; i <= 9; i++) State.appendStep("integration_claude", `burst ${i}`);
+    ticker.sync(t);
+
+    eq(ticker.pending.length, 4, "a 9-step burst keeps MAX_QUEUE entries");
+    eq(ticker.pending.at(-1), "burst 9", "and the burst's last step is among them");
+  });
+
+  await test("the overview counter reads the history, never 20/20", async () => {
+    const t = seedTask();
+    for (let i = 1; i <= 47; i++) State.appendStep("integration_claude", `step ${i}`);
+
+    // What `views.ts` puts in the badge. The old expression was
+    // `min(stepIndex + 1, steps.length) / steps.length`, pinned at 20/20.
+    eq(t.steps.length > 1, true, "more than one step shows a counter");
+    eq(`${t.steps.length} steps`, "47 steps", "the counter tracks the session");
   });
 
   // ── Engine: animation triggers ─────────────────────────────────────────────
@@ -487,6 +732,21 @@ export async function run({ suite, test, assert, eq, sleep }: Ctx) {
     busy.celebrateIfWorthIt(4);
     assert((busy as unknown as { engine: BotEngine }).engine.isAnimating("oy"),
       "a 4-step turn should celebrate");
+  });
+
+  await test("a saturated session still does not celebrate a one-line turn", async () => {
+    // The regression: `Stop` used to pass `steps.length`, which counts the whole
+    // session. A long session made every turn look busy, so the one-line edit the
+    // gate exists to stay quiet for threw a party every time.
+    const t = seedTask();
+    for (let i = 1; i <= 40; i++) State.appendStep("integration_claude", `step ${i}`);
+    eq(t.steps.length, 40, "precondition: the session is long");
+
+    const island = freshIsland();
+    // What a one-line turn hands the gate now: this turn's own count.
+    island.celebrateIfWorthIt(1);
+    assert(!(island as unknown as { engine: BotEngine }).engine.isAnimating("oy"),
+      "a long session must not make every turn look worth celebrating");
   });
 
   await test("react refuses on top of a dizzy override", async () => {

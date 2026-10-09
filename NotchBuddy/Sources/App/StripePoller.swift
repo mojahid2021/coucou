@@ -138,6 +138,7 @@ final class StripePoller: @unchecked Sendable {
 
         state.tasks[idx].state = .finished
         state.tasks[idx].steps = [newest.description ?? newest.amountFormatted]
+        state.tasks[idx].stepIndex = state.tasks[idx].steps.count - 1
         if !focused { state.tasks[idx].pillBadge = .finished }
         SoundEngine.shared.play("finish")
 
@@ -154,6 +155,7 @@ final class StripePoller: @unchecked Sendable {
             guard state.tasks[i].state == .finished else { return }
             state.tasks[i].state = .idle
             state.tasks[i].steps = []
+            state.tasks[i].stepIndex = 0
             state.tasks[i].pillBadge = nil
         }
     }

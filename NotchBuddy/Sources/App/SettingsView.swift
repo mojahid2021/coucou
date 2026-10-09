@@ -57,6 +57,7 @@ struct SettingsView: View {
     // Multi-provider chat keys
     @State private var googleKey: String  = KeychainStore.shared.get("google-api-key") ?? ""
     @State private var openAIKey: String  = KeychainStore.shared.get("openai-api-key") ?? ""
+    @State private var customKey: String  = KeychainStore.shared.get("custom-api-key") ?? ""
 
     // Integration keys
     @State private var resendKey: String    = KeychainStore.shared.get("resend-api-key")  ?? ""
@@ -164,6 +165,45 @@ struct SettingsView: View {
                             statusMessage = "✓ OpenAI key saved."
                         }
                         .buttonStyle(.borderedProminent)
+
+                        // ── Custom OpenAI-compatible endpoint ──
+                        Divider().padding(.vertical, 2)
+
+                        HStack(spacing: 8) {
+                            Circle().fill(Color(hex: ChatProvider.custom.accentHex)).frame(width: 8, height: 8)
+                            Text("Custom endpoint").font(.system(size: 12, weight: .semibold))
+                        }
+                        Text("Any OpenAI-compatible server: OpenRouter, Groq, Ollama, LM Studio, vLLM. Coucou asks it nothing until you send a message — and whatever URL you set receives the whole conversation.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        TextField("Base URL (https://api.openai.com/v1)", text: $state.customChatBaseUrl)
+                            .textFieldStyle(.roundedBorder)
+                            .onChange(of: state.customChatBaseUrl) { _, value in
+                                // Trimmed on the way in so the saved value is
+                                // always the bare base the requests are built from.
+                                let base = ChatProvider.custom.normalizedBaseURL(value)
+                                if let base, base != value {
+                                    state.customChatBaseUrl = base
+                                }
+                            }
+                        SecureField("API key (optional — leave empty for a local server)", text: $customKey)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("Model id (e.g. gpt-4o-mini)", text: $state.customChatModel)
+                            .textFieldStyle(.roundedBorder)
+                        HStack(spacing: 8) {
+                            Button("Save key") {
+                                KeychainStore.shared.set("custom-api-key", value: customKey)
+                                customKey = ""
+                                statusMessage = "✓ Custom endpoint key saved."
+                            }
+                            .buttonStyle(.borderedProminent)
+                            if KeychainStore.shared.get("custom-api-key") != nil {
+                                Button("Remove key") {
+                                    KeychainStore.shared.remove("custom-api-key")
+                                    statusMessage = "✓ Custom endpoint key removed."
+                                }
+                            }
+                        }
                     }
                     .padding(.vertical, 4)
                 }
@@ -927,8 +967,16 @@ struct SettingsView: View {
             #endif
             if def.category == .ai {
                 let keyId = def.id == "ai_anthropic" ? "anthropic-api-key"
-                           : def.id == "ai_google"    ? "google-api-key" : "openai-api-key"
-                if KeychainStore.shared.get(keyId) == nil { return "Key not configured" }
+                           : def.id == "ai_google"    ? "google-api-key"
+                           : def.id == "ai_openai"    ? "openai-api-key"
+                           :                             "custom-api-key"
+                // A custom endpoint is configured by its base URL, not its key —
+                // a local server legitimately has neither.
+                if def.id == "ai_custom" {
+                    if ChatProvider.custom.normalizedBaseURL(state.customChatBaseUrl) == nil {
+                        return "No base URL"
+                    }
+                } else if KeychainStore.shared.get(keyId) == nil { return "Key not configured" }
             }
             return nil
         }()

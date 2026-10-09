@@ -6,7 +6,8 @@
 import "./settings.css";
 import { Bridge, onEvent, type HookStatus, type HookTarget } from "../core/bridge";
 import {
-  AUTO_CLOSE_MAX, AUTO_CLOSE_MIN, DEFAULT_SETTINGS, clampAutoClose, type Settings,
+  AUTO_CLOSE_MAX, AUTO_CLOSE_MIN, DEFAULT_SETTINGS, clampAutoClose,
+  normalizeChatProvider, type ChatProviderId, type Settings,
 } from "../core/state";
 import { h, clear } from "../views/dom";
 
@@ -266,15 +267,24 @@ function apiSection(hasKey: boolean): HTMLElement {
     }
   });
 
+  // A model id typed here that is not a Claude model means the user pointed the
+  // chat at their own endpoint and then changed their mind — or edited this by
+  // mistake. Say so instead of quietly storing it as a Claude model, which is
+  // what produced an "auto/best-chat" Anthropic model and the confusing
+  // "API key missing" that followed.
   const model = h("select", {}) as HTMLSelectElement;
   for (const [id, label] of MODELS) model.append(h("option", { value: id, text: label }));
-  if (!MODELS.some(([id]) => id === settings.model)) {
-    model.append(h("option", { value: settings.model, text: settings.model }));
+  const stored = settings.model;
+  if (!MODELS.some(([id]) => id === stored)) {
+    model.append(h("option", {
+      value: stored,
+      text: `${stored}  (not a Claude model — switch the chat to “Custom endpoint” to use it)`,
+    }));
   }
-  model.value = settings.model;
+  model.value = stored;
   model.addEventListener("change", () => {
     settings.model = model.value;
-    void save();
+    void Bridge.chatSet({ model: model.value });
   });
 
   clearBtn.style.display = hasKey ? "" : "none";
@@ -286,6 +296,193 @@ function apiSection(hasKey: boolean): HTMLElement {
     state,
     h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
     h("div", { class: "row" }, h("label", { text: "Model" }), model),
+    feedback,
+  );
+}
+
+// ── Custom endpoint section ───────────────────────────────────────────────────
+
+/**
+ * A provider whose base URL, key and model the user supplies.
+ *
+ * The key field is genuinely optional — a local Ollama or LM Studio answers with
+ * no auth at all — so it is not gated behind a non-empty base URL the way a
+ * hosted provider's would be, and leaving it blank must not read as an error.
+ */
+function customEndpointSection(hasKey: boolean): HTMLElement {
+  const baseUrl = h("input", {
+    type: "text",
+    placeholder: "https://api.openai.com/v1",
+    value: settings.customBaseUrl ?? "",
+    autocomplete: "off",
+    spellcheck: "false",
+    style: "flex:1 1 auto;min-width:0",
+  }) as HTMLInputElement;
+
+  const key = h("input", {
+    type: "password",
+    placeholder: hasKey ? "••••••••  (stored)" : "optional — leave empty for a local server",
+    autocomplete: "off",
+    spellcheck: "false",
+    style: "flex:1 1 auto;min-width:0",
+  }) as HTMLInputElement;
+
+  const model = h("input", {
+    type: "text",
+    placeholder: "gpt-4o-mini",
+    value: settings.customModel ?? "",
+    autocomplete: "off",
+    spellcheck: "false",
+    style: "flex:1 1 auto;min-width:0",
+  }) as HTMLInputElement;
+  const models = h("datalist", { id: "coucou-custom-models" }) as HTMLDataListElement;
+
+  const keyDot = statusDot(hasKey);
+  const feedback = h("div", {});
+  const saveKey = h("button", { class: "primary", text: "Save key" });
+  const clearKey = h("button", { class: "danger", text: "Remove" });
+  const loadModels = h("button", { text: "Load models" });
+
+  // Which provider answers the chat. This lives here as well as in the island's
+  // model picker because it is the one setting that decides whether the endpoint
+  // below is used at all — configuring a base URL without switching to Custom
+  // leaves the chat on Anthropic, with nothing on screen saying so.
+  const provider = h("select", { style: "flex:1 1 auto;min-width:0" }) as HTMLSelectElement;
+  for (const [id, label] of [["anthropic", "Anthropic"], ["custom", "Custom endpoint"]]) {
+    provider.append(h("option", { value: id, text: label }));
+  }
+  provider.value = normalizeChatProvider(settings.chatProvider);
+  provider.addEventListener("change", () => {
+    const value = provider.value as ChatProviderId;
+    settings.chatProvider = value;
+    void Bridge.chatSet({ provider: value });
+    syncProviderNote();
+  });
+
+  const providerNote = h("div", { class: "hint" });
+  function syncProviderNote() {
+    const on = normalizeChatProvider(settings.chatProvider) === "custom";
+    providerNote.textContent = on
+      ? "The chat will use the endpoint below."
+      : "The chat is using Anthropic. The endpoint below is saved but not used until you switch to “Custom endpoint” here, or pick Custom in the model menu inside the chat.";
+  }
+
+  // The base URL and model are plain settings — no secret, nothing to confirm —
+  // so they save on change rather than needing a button each. Routed through
+  // chatSet so this window cannot write back a stale copy of `chatProvider` and
+  // silently undo a switch made in the island.
+  baseUrl.addEventListener("change", () => {
+    settings.customBaseUrl = baseUrl.value.trim().replace(/\/+$/, "");
+    baseUrl.value = settings.customBaseUrl;
+    void Bridge.chatSet({ customBaseUrl: settings.customBaseUrl });
+  });
+  model.addEventListener("change", () => {
+    settings.customModel = model.value.trim();
+    model.value = settings.customModel;
+    void Bridge.chatSet({ customModel: settings.customModel });
+  });
+
+  loadModels.addEventListener("click", async () => {
+    // Committed first: chatModels reads the saved settings, so a value still
+    // sitting in the field would be fetched against the previous endpoint.
+    settings.customBaseUrl = baseUrl.value.trim().replace(/\/+$/, "");
+    settings.customModel = model.value.trim();
+    baseUrl.value = settings.customBaseUrl;
+    model.value = settings.customModel;
+    await Bridge.chatSet({
+      customBaseUrl: settings.customBaseUrl,
+      customModel: settings.customModel,
+    });
+    clear(feedback);
+    loadModels.disabled = true;
+    loadModels.textContent = "Loading…";
+    try {
+      const found = (await Bridge.chatModels()) ?? [];
+      clear(models);
+      for (const m of found) {
+        models.append(h("option", { value: m.id }));
+      }
+      feedback.append(
+        found.length
+          ? h("div", { class: "notice ok", text: `${found.length} models available.` })
+          : h("div", {
+              class: "notice warn",
+              text: "That endpoint returned no models. Type the model id yourself — it is not required to be in the list.",
+            }),
+      );
+    } catch (err) {
+      feedback.append(h("div", {
+        class: "notice err",
+        text: `Could not load models: ${String(err).replace(/^Error:\s*/, "")}`,
+      }));
+    } finally {
+      loadModels.disabled = false;
+      loadModels.textContent = "Load models";
+    }
+  });
+
+  saveKey.addEventListener("click", async () => {
+    const value = key.value.trim();
+    clear(feedback);
+    try {
+      await Bridge.secretSet("custom-api-key", value);
+      key.value = "";
+      const present = value.length > 0;
+      key.placeholder = present ? "••••••••  (stored)" : "optional — leave empty for a local server";
+      keyDot.style.background = present ? "#22c55e" : "#f4505e";
+      clearKey.style.display = present ? "" : "none";
+      feedback.append(h("div", {
+        class: "notice ok",
+        text: present ? "Saved. It never touches disk." : "Removed — this endpoint needs no key.",
+      }));
+    } catch (err) {
+      feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
+    }
+  });
+
+  clearKey.addEventListener("click", async () => {
+    clear(feedback);
+    try {
+      await Bridge.secretClear("custom-api-key");
+      keyDot.style.background = "#f4505e";
+      key.placeholder = "optional — leave empty for a local server";
+      clearKey.style.display = "none";
+      feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
+    } catch (err) {
+      feedback.append(h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }));
+    }
+  });
+
+  clearKey.style.display = hasKey ? "" : "none";
+  syncProviderNote();
+
+  return h(
+    "section",
+    {},
+    h("h2", {}, keyDot, h("span", { text: "Chat provider" })),
+    h("div", { class: "row" },
+      h("label", { style: "min-width:104px", text: "Answers with" }),
+      provider,
+    ),
+    providerNote,
+    h("h2", {}, keyDot, h("span", { text: "Chat — custom endpoint" })),
+    h("div", {
+      class: "hint",
+      text: "Any OpenAI-compatible server: OpenAI, OpenRouter, Groq, Ollama, LM Studio, vLLM. Coucou asks it nothing until you send a message — and whatever URL you set receives the whole conversation.",
+    }),
+    h("div", { class: "row" },
+      h("label", { style: "min-width:104px", text: "Base URL" }),
+      baseUrl,
+    ),
+    h("div", { class: "row" },
+      h("label", { style: "min-width:104px", text: "API key" }),
+      key, saveKey, clearKey,
+    ),
+    h("div", { class: "row" },
+      h("label", { style: "min-width:104px", text: "Model" }),
+      model, loadModels,
+    ),
+    models,
     feedback,
   );
 }
@@ -474,6 +671,7 @@ async function main() {
   const copilot = copilotStatus ?? missingStatus;
 
   const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
+  const hasCustomKey = (await Bridge.secretPresent("custom-api-key")) ?? false;
 
   const keys = [
     "stripe-api-key", "github-token", "vercel-token",
@@ -488,6 +686,7 @@ async function main() {
     claudeSection(claude),
     copilotSection(copilot),
     apiSection(hasKey),
+    customEndpointSection(hasCustomKey),
     integrationsSection(present),
     generalSection(),
     h("div", {

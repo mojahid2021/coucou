@@ -72,6 +72,10 @@ enum PillCatalog {
               category: .ai,        subtitle: "Chat",         source: .n8n),
         .init(id: "ai_openai",           name: "OpenAI",      color: ChatProvider.openai.accentHex,
               category: .ai,        subtitle: "Chat",         source: .n8n),
+        // The user's own OpenAI-compatible endpoint. Available in both builds:
+        // it only ever reads files the user dropped on the island themselves.
+        .init(id: "ai_custom",           name: "Custom",      color: ChatProvider.custom.accentHex,
+              category: .ai,        subtitle: "Chat",         source: .n8n),
         // ── Services ─────────────────────────────────────────────────────────
         .init(id: "integration_resend",  name: "Resend",      color: "#22C55E",
               category: .service,   subtitle: "Integration",  source: .n8n),

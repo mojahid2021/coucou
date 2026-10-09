@@ -34,6 +34,10 @@ final class AppState: ObservableObject {
     var lastMouseMove: Date = .now
     var lastActivity: Date = .now
     var isPresent: Bool = true
+    /// Whether the pointer is over the island. The FSM reads it to pause the
+    /// auto-close clock, and the countdown bar to hide while the clock is paused.
+    /// Sampled by `IslandWindowController.pollFrame()` before each FSM hover call.
+    var pointerOverIsland: Bool = false
 
     // Pinned (alerts that stay open, never auto-close)
     var isPinned: Bool = false
@@ -69,14 +73,25 @@ final class AppState: ObservableObject {
     @Published var openAIChatModel: String = ChatProvider.openai.defaultModel {
         didSet { UserDefaults.standard.set(openAIChatModel, forKey: "openAIChatModel") }
     }
+    /// Model id sent to the user's own OpenAI-compatible endpoint. No default:
+    /// there is no way to know what an arbitrary server calls its models.
+    @Published var customChatModel: String = "" {
+        didSet { UserDefaults.standard.set(customChatModel, forKey: "customChatModel") }
+    }
+    /// Base URL of that endpoint, e.g. `http://localhost:11434/v1`. Not a secret.
+    @Published var customChatBaseUrl: String = "" {
+        didSet { UserDefaults.standard.set(customChatBaseUrl, forKey: "customChatBaseUrl") }
+    }
 
     // The always-on workspace pill (default: VS Code). Persisted.
     @Published var mainPillId: String = PillCatalog.defaultMainPillId {
         didSet { UserDefaults.standard.set(mainPillId, forKey: "mainPill") }
     }
 
-    // Dynamically fetched model lists for the in-chat picker (keyed by provider)
-    @Published var fetchedProviderModels: [ChatProvider: [(id: String, label: String)]] = [:]
+    // Dynamically fetched model lists for the in-chat picker (keyed by provider).
+    // The detail is nil for the hosted providers, which report no limits or
+    // capabilities — only a custom endpoint does.
+    @Published var fetchedProviderModels: [ChatProvider: [(id: String, label: String, detail: ChatModelDetail?)]] = [:]
     @Published var providerModelFetchError: [ChatProvider: String] = [:]
     @Published var loadingProviderModels: Set<ChatProvider> = []
 
@@ -85,26 +100,50 @@ final class AppState: ObservableObject {
     func fetchModelsIfNeeded(for provider: ChatProvider) {
         guard !loadingProviderModels.contains(provider),
               fetchedProviderModels[provider] == nil else { return }
-        guard let apiKey = KeychainStore.shared.get(provider.keychainKey), !apiKey.isEmpty else {
-            providerModelFetchError[provider] = "No API key — add it in Settings."
-            return
+        // A custom endpoint needs a base URL before it can be asked anything,
+        // and its key may legitimately be missing — so the key check that stops
+        // the other three providers does not apply to it.
+        if provider == .custom {
+            guard !customChatBaseUrl.trimmingCharacters(in: .whitespaces).isEmpty else {
+                providerModelFetchError[provider] = "No base URL — add one in Settings."
+                return
+            }
+        } else {
+            guard let apiKey = KeychainStore.shared.get(provider.keychainKey), !apiKey.isEmpty else {
+                providerModelFetchError[provider] = "No API key — add it in Settings."
+                return
+            }
         }
         loadingProviderModels.insert(provider)
         providerModelFetchError.removeValue(forKey: provider)
+        // Read before the Task so the request cannot race a Settings edit.
+        let baseURL = customChatBaseUrl
         Task {
-            let models: [(id: String, label: String)]
+            let models: [(id: String, label: String, detail: ChatModelDetail?)]
             switch provider {
-            case .anthropic: models = await ClaudeService.fetchModels(apiKey: apiKey)
-            case .google:    models = await ClaudeService.fetchGoogleModels(apiKey: apiKey)
-            case .openai:    models = await ClaudeService.fetchOpenAIModels(apiKey: apiKey)
+            case .anthropic:
+                models = await ClaudeService.fetchModels(apiKey: KeychainStore.shared.get("anthropic-api-key") ?? "")
+            case .google:
+                models = await ClaudeService.fetchGoogleModels(apiKey: KeychainStore.shared.get("google-api-key") ?? "")
+            case .openai:
+                models = await ClaudeService.fetchOpenAIModels(apiKey: KeychainStore.shared.get("openai-api-key") ?? "")
+            case .custom:
+                models = await ClaudeService.fetchCustomModels(
+                    baseURL: baseURL,
+                    apiKey: KeychainStore.shared.get("custom-api-key")
+                )
             }
             loadingProviderModels.remove(provider)
             if models.isEmpty {
-                providerModelFetchError[provider] = "Failed to load models. Check your API key."
+                // Not a dead end for `.custom`: the picker still accepts a typed
+                // model id, which is the only way through on a server with no
+                // `/models` route.
+                providerModelFetchError[provider] = "Failed to load models. Check the base URL and key — or type the model id."
             } else {
                 fetchedProviderModels[provider] = models
                 // If the saved model isn't in the fetched list, pick a sensible default:
                 // prefer "sonnet" (Anthropic), "flash" (Google), "mini" (OpenAI); else first.
+                // `.custom` gets none of this — its ids mean nothing to us.
                 switch provider {
                 case .anthropic:
                     if !models.contains(where: { $0.id == claudeModel }) {
@@ -118,6 +157,10 @@ final class AppState: ObservableObject {
                     if !models.contains(where: { $0.id == openAIChatModel }) {
                         openAIChatModel = models.first(where: { $0.id.contains("mini") })?.id ?? models.first!.id
                     }
+                case .custom:
+                    if !models.contains(where: { $0.id == customChatModel }), customChatModel.isEmpty {
+                        customChatModel = models[0].id
+                    }
                 }
             }
         }
@@ -129,6 +172,7 @@ final class AppState: ObservableObject {
         case .anthropic: return claudeModel
         case .google:    return googleChatModel
         case .openai:    return openAIChatModel
+        case .custom:    return customChatModel
         }
     }
 
@@ -270,6 +314,8 @@ final class AppState: ObservableObject {
         if let v = ud.string(forKey: "chatProvider"), let p = ChatProvider(rawValue: v) { chatProvider = p }
         if let v = ud.string(forKey: "googleChatModel"), !v.isEmpty { googleChatModel = v }
         if let v = ud.string(forKey: "openAIChatModel"), !v.isEmpty { openAIChatModel = v }
+        if let v = ud.string(forKey: "customChatModel") { customChatModel = v }
+        if let v = ud.string(forKey: "customChatBaseUrl") { customChatBaseUrl = v }
         // Migrate old 60s default → 15s
         if let v = ud.object(forKey: "autoCloseInterval") as? Double {
             autoCloseInterval = (v == 60) ? 15 : v

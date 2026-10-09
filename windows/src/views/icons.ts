@@ -20,6 +20,8 @@ export const ICONS = {
   // chevron.right
   chevronRight: "M9 5.5 15.5 12 9 18.5",
   chevronLeft: "M15 5.5 8.5 12 15 18.5",
+  // chevron.up.chevron.down — the model capsule affordance on macOS
+  chevronUpDown: "M8.4 10.6 12 7l3.6 3.6-1.3 1.3L12 9.8l-2.3 2.1-1.3-1.3zm7.2 2.8L12 17l-3.6-3.6 1.3-1.3 2.3 2.1 2.3-2.1 1.3 1.3z",
   // checkmark
   check: "M5 12.5 9.5 17 19 7.5",
   // arrow.up (send)
